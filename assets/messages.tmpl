@@ -1,0 +1,61 @@
+{{/*
+  All user-facing terminal copy lives here, as named text/template blocks.
+  Rendered against a *view* (see config.go): installation fields come from the
+  embedded *Config (.UserHost, .SSHUser, .SSHHost, .AppDomain, .ShortLen),
+  per-session values are the view's own fields (.PubKey, .Bolt11, .ShortName,
+  .QRW/.QRH/.W/.H). Whitespace inside each define is significant — it is what
+  the client sees. "upper" is the only custom func.
+*/}}
+
+{{define "banner"}}
+Welcome to {{.UserHost}}. Make your local http application available
+on a subdomain https://<YOUR>.{{.AppDomain}}.
+
+<YOUR> stands for a random {{.ShortLen}}-letter shortname that you receive
+after paying a Bitcoin Lightning invoice. Payment is required once for
+each SSH key you use for logging in. As long as you use the same key
+again, your subdomain name will be always yours, for the lifetime of
+this project.
+
+If you're running a web application locally on http://localhost:5000,
+forwarding it to your subdomain is done like this:
+
+  ssh -R80:localhost:5000 {{.UserHost}}
+
+Port 80 ^ here is just a convention, as you're forwarding your
+unencrypted server to the remote machine. Our reverse proxy handles
+HTTPS for your subdomain.
+
+{{end}}
+
+{{define "greeting"}}{{upper .UserHost}} knows you...
+
+Authorizing key: {{.PubKey}}
+{{end}}
+
+{{define "pleasePay"}}Please pay: {{.Bolt11}}
+{{end}}
+
+{{define "qrTooLarge"}}
+QR code ({{.QRW}}x{{.QRH}}) too large for the screen ({{.W}}x{{.H}})
+Relogin with larger window / smaller font to get it.
+
+{{end}}
+
+{{define "site"}}Your forwarded site: https://{{.ShortName}}.{{.AppDomain}}
+{{end}}
+
+{{define "forwarding"}}Connections are forwarded until you exit.
+{{end}}
+
+{{define "hint"}}Hint: use ssh -R80:localhost:5000 {{.UserHost}}
+if you have your application listening on port 5000
+{{end}}
+
+{{define "backendDown"}}
+Payment backend is not responding, please try again later.
+{{end}}
+
+{{define "goodbye"}}
+Good bye!
+{{end}}

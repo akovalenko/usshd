@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,7 +18,6 @@ import (
 
 	"crypto/sha256"
 	"encoding/hex"
-	mr "math/rand/v2"
 
 	"github.com/akovalenko/usshd/billing"
 	"github.com/akovalenko/usshd/limiter"
@@ -36,27 +34,6 @@ import (
 	"os/signal"
 	"syscall"
 )
-
-const banner = `
-Welcome to app@ssh.my-ns.me. Make your local http application available
-on a subdomain https://<YOUR>.app.my-ns.me.
-
-<YOUR> stands for a random four-letter shortname that you receive
-after paying a Bitcoin Lightning invoice. Payment is required once for
-each SSH key you use for logging in. As long as you use the same key
-again, your subdomain name will be always yours, for the lifetime of
-this project.
-
-If you're running a web application locally on http://localhost:5000,
-forwarding it to your subdomain is done like this:
-
-  ssh -R80:localhost:5000 app@ssh.my-ns.me
-
-Port 80 ^ here is just a convention, as you're forwarding your
-unencrypted server to the remote machine. Our reverse proxy (caddy
-server) handles HTTPS for your subdomain.
-
-`
 
 var qrConfig = qrterminal.Config{
 	HalfBlocks:     true,
@@ -82,14 +59,6 @@ func qrDimensions(b []byte) (uint32, uint32) {
 		uint32(lines)
 }
 
-func randomShortName(n int) string {
-	rns := make([]rune, n)
-	for i, _ := range rns {
-		rns[i] = rune('a' + mr.IntN(26))
-	}
-	return string(rns)
-}
-
 func netAddrIp(a net.Addr) string {
 	hostPort := a.String()
 	colon := strings.LastIndexByte(hostPort, ':')
@@ -112,19 +81,23 @@ func netAddrIpPort(a net.Addr) (string, uint32) {
 	return hostPort[:colon], uint32(port)
 }
 
-func acceptAnyPublicKey(md ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-	fp := sha256.Sum256(key.Marshal())
-	hexFp := hex.EncodeToString(fp[:])
-	if md.User() != "app" {
-		return nil, errors.New("Only app@ for now")
-	}
+// makeAuthCallback accepts any public key, provided the login name matches the
+// installation's configured SSH user. Identity is the key's sha256 fingerprint.
+func makeAuthCallback(user string) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+	return func(md ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		fp := sha256.Sum256(key.Marshal())
+		hexFp := hex.EncodeToString(fp[:])
+		if md.User() != user {
+			return nil, fmt.Errorf("only %s@ for now", user)
+		}
 
-	return &ssh.Permissions{
-		Extensions: map[string]string{
-			"public-key": string(ssh.MarshalAuthorizedKey(key)),
-			"fprint":     hexFp,
-		},
-	}, nil
+		return &ssh.Permissions{
+			Extensions: map[string]string{
+				"public-key": string(ssh.MarshalAuthorizedKey(key)),
+				"fprint":     hexFp,
+			},
+		}, nil
+	}
 }
 
 type CrWriter struct {
@@ -237,6 +210,7 @@ func (uh *Ushttpd) handleConn(conn net.Conn) {
 }
 
 type Usshd struct {
+	conf    *Config
 	sshConf *ssh.ServerConfig
 	biller  *billing.Billing
 	perIp   *limiter.Limiter[string]
@@ -348,7 +322,7 @@ func (sshd *Usshd) serveConn(ctx0 context.Context, conn net.Conn) error {
 
 	err = sshsc.Wait()
 	if uc.shortname != "" {
-		uc.sshd.httpd.RemoveForwarder(uc.shortname+".app.my-ns.me", uc)
+		uc.sshd.httpd.RemoveForwarder(uc.shortname+"."+sshd.conf.AppDomain, uc)
 	}
 	return err
 }
@@ -464,9 +438,8 @@ nonLarval:
 
 	userId := uc.sc.Permissions.Extensions["fprint"]
 
-	io.WriteString(stdout, "APP@SSH.MY-NS.ME knows you...\n")
-	fmt.Fprintf(stdout, "\nAuthorizing key: %v\n",
-		uc.sc.Permissions.Extensions["public-key"])
+	uc.emit(stdout, "greeting",
+		view{PubKey: uc.sc.Permissions.Extensions["public-key"]})
 
 	usub := uc.sshd.biller.Subscribe(userId)
 	defer uc.sshd.biller.Unsubscribe(usub)
@@ -486,7 +459,7 @@ nonLarval:
 			}
 			if rec.Bolt11 != "" {
 				if !printedIntro {
-					stdout.Write([]byte(banner))
+					uc.emit(stdout, "banner", view{})
 					printedIntro = true
 				}
 			}
@@ -506,7 +479,7 @@ nonLarval:
 				goto finish
 			}
 		case <-timeoutC:
-			fmt.Fprint(stdout, "\nPayment backend is not responding, please try again later.\n")
+			uc.emit(stdout, "backendDown", view{})
 			goto cancelling
 		case <-ctx.Done():
 			goto cancelling
@@ -514,45 +487,37 @@ nonLarval:
 	}
 finish:
 	if uc.haveForwards.Load() {
-		fmt.Fprint(stdout, "Connections are forwarded until you exit.\n")
+		uc.emit(stdout, "forwarding", view{})
 	} else {
-		fmt.Fprint(stdout, "Hint: use ssh -R80:localhost:5000 app@ssh.my-ns.me\nif you have your application listening on port 5000\n")
+		uc.emit(stdout, "hint", view{})
 	}
 	<-ctx.Done()
 
 cancelling:
-	fmt.Fprint(stdout, "\nGood bye!\n")
+	uc.emit(stdout, "goodbye", view{})
 	sess.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 	sess.Close()
 	return context.Cause(ctx)
 }
 
-func (uc *usshConn) printUserRec(out io.Writer, rec *billing.UserRecord, w, h uint32) error {
+func (uc *usshConn) printUserRec(out io.Writer, rec *billing.UserRecord, w, h uint32) {
 	if rec.Bolt11 != "" {
-		if _, err := fmt.Fprintf(out, "Please pay: %v\n", rec.Bolt11); err != nil {
-			return err
-		}
+		uc.emit(out, "pleasePay", view{Bolt11: rec.Bolt11})
 		if w == 0 || h == 0 {
-			return nil
+			return
 		}
 		qr := qrEncode(strings.ToUpper(rec.Bolt11))
 		qrw, qrh := qrDimensions(qr)
 		if qrw+1 < w && qrh+1 < h {
 			out.Write(qr)
 		} else {
-			if _, err := fmt.Fprintf(out, "\nQR code (%vx%v) too large for the screen (%vx%v)\nRelogin with larger window / smaller font to get it.\n\n",
-				qrw+1, qrh+1, w, h); err != nil {
-				return err
-			}
+			uc.emit(out, "qrTooLarge",
+				view{QRW: qrw + 1, QRH: qrh + 1, W: w, H: h})
 		}
 	}
 	if rec.ShortName != "" {
-		_, err := fmt.Fprintf(out,
-			"Your forwarded site: https://%v.app.my-ns.me\n", rec.ShortName,
-		)
-		return err
+		uc.emit(out, "site", view{ShortName: rec.ShortName})
 	}
-	return nil
 }
 
 func (uc *usshConn) HandleForwarding(ctx context.Context, req *ssh.Request) error {
@@ -587,7 +552,7 @@ func (uc *usshConn) HandleForwarding(ctx context.Context, req *ssh.Request) erro
 	req.Reply(true, ssh.Marshal(fwdOk))
 	log.Println("forwarding requested for: ", fwd.Addr)
 	uc.fwhost = fwd.Addr
-	uc.sshd.httpd.RegisterForwarder(uc.shortname+".app.my-ns.me", uc)
+	uc.sshd.httpd.RegisterForwarder(uc.shortname+"."+uc.sshd.conf.AppDomain, uc)
 	return nil
 }
 
@@ -662,14 +627,9 @@ func mustLoadPrivateKey(filename string) ssh.Signer {
 	return signer
 }
 
-func coalesce(s1, s2 string) string {
-	if s1 != "" {
-		return s1
-	}
-	return s2
-}
-
 func main() {
+
+	conf := loadConfig()
 
 	db, err := sql.Open("sqlite", "users.db")
 	if err != nil {
@@ -681,15 +641,15 @@ func main() {
 
 	biller := billing.NewBilling(
 		&billing.BillingConf{
-			Cost:   1000,
-			Memo:   "app@ssh.my-ns.me",
-			Expiry: 3600,
+			Cost:         conf.Cost,
+			Memo:         conf.InvoiceMemo,
+			Expiry:       conf.InvoiceExpiry,
+			ShortNameLen: conf.ShortLen,
 		},
 		db,
 		&lnbits.Client{
-			Url: coalesce(os.Getenv("LNBITS_HOST"),
-				"https://bs.se.my-ns.me"),
-			ApiKey: os.Getenv("LNBITS_API_KEY"),
+			Url:    conf.LnbitsHost,
+			ApiKey: conf.LnbitsApiKey,
 		})
 
 	var wg sync.WaitGroup
@@ -710,7 +670,7 @@ func main() {
 	utils.Run(ctx, time.Minute, false, perIp.Gc)
 
 	svrCfg := &ssh.ServerConfig{
-		PublicKeyCallback: acceptAnyPublicKey,
+		PublicKeyCallback: makeAuthCallback(conf.SSHUser),
 	}
 
 	svrCfg.AddHostKey(mustLoadPrivateKey("id_ecdsa"))
@@ -722,6 +682,7 @@ func main() {
 	}
 
 	sshd := &Usshd{
+		conf:    conf,
 		sshConf: svrCfg,
 		biller:  biller,
 		perIp:   perIp,
@@ -731,8 +692,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := httpd.ListenAndServe(ctx,
-			coalesce(os.Getenv("LISTEN_HTTP"), "127.0.0.1:8088"))
+		err := httpd.ListenAndServe(ctx, conf.ListenHTTP)
 
 		log.Println("canceled httpd: ", err)
 		if err != nil {
@@ -742,8 +702,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := sshd.ListenAndServe(ctx,
-			coalesce(os.Getenv("LISTEN_SSH"), "127.0.0.1:8024"))
+		err := sshd.ListenAndServe(ctx, conf.ListenSSH)
 		log.Println("canceled sshd: ", err)
 		if err != nil {
 			cancel(err)

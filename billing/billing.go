@@ -149,10 +149,11 @@ func (uc *userCache) Content() []*UserRecord {
 }
 
 type BillingConf struct {
-	Cost   int
-	Memo   string
-	Expiry int
-	Unit   string
+	Cost         int
+	Memo         string
+	Expiry       int
+	Unit         string
+	ShortNameLen int
 }
 
 type Billing struct {
@@ -391,9 +392,13 @@ func (b *Billing) dbReinvoiceUser(ctx context.Context, u string) error {
 
 func (b *Billing) dbAdmitUser(ctx context.Context, u string) error {
 	// mark as admitted
+	n := b.conf.ShortNameLen
+	if n < 1 {
+		n = 4
+	}
 	shortName := ""
 	for {
-		shortName = randomShortName(4)
+		shortName = randomShortName(n)
 		row := b.db.QueryRow("SELECT id FROM users WHERE shortname=?", shortName)
 		var r string
 		err := row.Scan(&r)
