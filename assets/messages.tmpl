@@ -33,6 +33,9 @@ HTTPS for your subdomain.
 Authorizing key: {{.PubKey}}
 {{end}}
 
+{{/* STABILITY CONTRACT: the "Please pay: <bolt11>" and "Your forwarded site:
+   <url>" lines are parsed by scripts and agents (grep/awk) and documented in
+   SKILL.md. Keep these exact prefixes intact. */}}
 {{define "pleasePay"}}Please pay: {{.Bolt11}}
 {{end}}
 

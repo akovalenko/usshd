@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Share your local web app globally — {{.AppDomain}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    max-width: 46rem; margin: 0 auto; padding: 2rem 1.2rem 4rem;
+    font: 16px/1.6 -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
+  }
+  h1 { font-size: 1.7rem; line-height: 1.2; }
+  h2 { font-size: 1.2rem; margin-top: 2.2rem; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre {
+    background: rgba(127,127,127,.14); padding: .8rem 1rem; border-radius: 6px;
+    overflow-x: auto; font-size: .92rem;
+  }
+  code { background: rgba(127,127,127,.14); padding: .1rem .35rem; border-radius: 4px; }
+  pre code { background: none; padding: 0; }
+  a { color: #2563eb; }
+  .price { font-weight: 600; }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid rgba(127,127,127,.3);
+           font-size: .9rem; color: #777; }
+</style>
+</head>
+<body>
+
+<h1>Share your local web app globally</h1>
+
+<p>Developing a web app locally is easy; showing it to the world usually is not.
+The traditional route is to deploy to a remote server behind a reverse proxy
+like Caddy or nginx, then keep the remote copy synchronized, upgraded and
+restarted every time you change something.</p>
+
+<p>There is a lighter way. Keep running your app on your own machine — say on
+<code>http://localhost:5000</code> — and forward it out over a single SSH
+command. No server to rent, nothing to configure remotely.</p>
+
+<h2>How it works</h2>
+
+<p>Point an SSH remote-forward at <code>{{.UserHost}}</code>:</p>
+
+<pre><code>ssh -R80:localhost:5000 {{.UserHost}}</code></pre>
+
+<p>On your first login with a given SSH key, a Bitcoin Lightning invoice is
+shown right in the terminal (as text and as a QR code). Pay it once —
+<span class="price">{{.Cost}} satoshi</span>, the invoice is valid for
+{{.ExpiryText}} — and your key is admitted. You immediately receive a
+permanent subdomain of the form <code>&lt;name&gt;.{{.AppDomain}}</code>,
+where <code>&lt;name&gt;</code> is a random {{.ShortLen}}-letter shortname.</p>
+
+<p>Payment is tied to the SSH key, not to an account — there is no signup, no
+login, no password. As long as you connect with the same key, the same
+subdomain stays yours for the lifetime of the project. HTTPS for your
+subdomain is terminated by our reverse proxy, so visitors reach your local
+app at <code>https://&lt;name&gt;.{{.AppDomain}}</code>.</p>
+
+<p>Port <code>80</code> above is just a convention — you are forwarding your
+plain HTTP server to the remote side, and the proxy wraps it in TLS.</p>
+
+<h2>For scripts and AI agents</h2>
+
+<p>The onboarding works without an interactive terminal, so it can be driven by
+a script or by an LLM agent. The invoice is printed on a stable line —
+<code>Please pay: &lt;bolt11&gt;</code> — that you can grep for:</p>
+
+<pre><code>ssh {{.UserHost}} &lt;/dev/null | grep 'Please pay:'</code></pre>
+
+<p>If you are wiring this up from an autonomous agent, there is a machine-readable
+guide with the exact steps (get the invoice, pay it or hand it to the user, then
+bring up the tunnel): <a href="/SKILL.md">/SKILL.md</a>.</p>
+
+<footer>
+Powered by <a href="{{.SourceURL}}">usshd</a>.
+</footer>
+
+</body>
+</html>

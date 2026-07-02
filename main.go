@@ -133,6 +133,7 @@ type Forwarder interface {
 }
 
 type Ushttpd struct {
+	conf       *Config
 	mu         sync.Mutex
 	forwarders map[string]Forwarder
 }
@@ -177,16 +178,55 @@ func (uh *Ushttpd) RemoveForwarder(host string, io Forwarder) {
 	uh.mu.Unlock()
 }
 
-func (uh *Ushttpd) Say502(conn net.Conn) {
+func (uh *Ushttpd) sayStatus(conn net.Conn, code int) {
 	resp := &http.Response{
-		Proto:      "http",
 		ProtoMajor: 1,
 		ProtoMinor: 1,
-		StatusCode: http.StatusBadGateway,
-		Status:     http.StatusText(http.StatusBadGateway),
+		StatusCode: code,
+		Status:     http.StatusText(code),
+		Close:      true,
 	}
 	resp.Write(conn)
 	conn.Close()
+}
+
+func (uh *Ushttpd) Say502(conn net.Conn) {
+	uh.sayStatus(conn, http.StatusBadGateway)
+}
+
+// serveLanding answers the landing host itself (the description page and
+// SKILL.md), rendering the whole-file templates against the installation config.
+func (uh *Ushttpd) serveLanding(conn net.Conn, req *http.Request) {
+	defer conn.Close()
+	var tmpl, ctype string
+	switch req.URL.Path {
+	case "/", "/index.html":
+		tmpl, ctype = "landing.html.tmpl", "text/html; charset=utf-8"
+	case "/SKILL.md":
+		tmpl, ctype = "skill.md.tmpl", "text/markdown; charset=utf-8"
+	default:
+		uh.sayStatus(conn, http.StatusNotFound)
+		return
+	}
+	var body bytes.Buffer
+	if err := descriptions.ExecuteTemplate(&body, tmpl, uh.conf); err != nil {
+		log.Printf("render %s: %v", tmpl, err)
+		uh.sayStatus(conn, http.StatusInternalServerError)
+		return
+	}
+	h := http.Header{}
+	h.Set("Content-Type", ctype)
+	resp := &http.Response{
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		StatusCode:    http.StatusOK,
+		Status:        http.StatusText(http.StatusOK),
+		Header:        h,
+		Body:          io.NopCloser(&body),
+		ContentLength: int64(body.Len()),
+		Close:         true,
+	}
+	resp.Write(conn)
 }
 
 func (uh *Ushttpd) handleConn(conn net.Conn) {
@@ -199,6 +239,10 @@ func (uh *Ushttpd) handleConn(conn net.Conn) {
 	}
 	host := req.Header.Get("x-forwarded-host")
 	host = strings.ToLower(host)
+	if uh.conf != nil && host == strings.ToLower(uh.conf.LandingHost) {
+		uh.serveLanding(conn, req)
+		return
+	}
 	uh.mu.Lock()
 	fwd, ok := uh.forwarders[host]
 	uh.mu.Unlock()
@@ -678,6 +722,7 @@ func main() {
 	svrCfg.AddHostKey(mustLoadPrivateKey("id_ed25519"))
 
 	httpd := &Ushttpd{
+		conf:       conf,
 		forwarders: make(map[string]Forwarder),
 	}
 

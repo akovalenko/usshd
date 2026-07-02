@@ -1,17 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"io"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 )
 
 func testConf() *Config {
 	return &Config{
-		SSHUser:   "app",
-		SSHHost:   "ssh.example.com",
-		AppDomain: "app.example.com",
-		ShortLen:  5,
+		SSHUser:       "app",
+		SSHHost:       "ssh.example.com",
+		AppDomain:     "app.example.com",
+		ShortLen:      5,
+		Cost:          1000,
+		InvoiceExpiry: 3600,
+		LandingHost:   "app.example.com",
+		SourceURL:     "https://github.com/akovalenko/usshd",
 	}
 }
 
@@ -51,6 +59,99 @@ func TestMessagesRender(t *testing.T) {
 		got := render(t, c.name, c.v)
 		if !strings.Contains(got, c.want) {
 			t.Errorf("%s: want substring %q, got %q", c.name, c.want, got)
+		}
+	}
+}
+
+// TestDescriptionsRender renders the landing page and SKILL.md against a Config,
+// checking the installation values substitute and the stable markers survive.
+func TestDescriptionsRender(t *testing.T) {
+	cases := []struct {
+		tmpl string
+		want []string
+	}{
+		{"landing.html.tmpl", []string{
+			"ssh -R80:localhost:5000 app@ssh.example.com",
+			"1000 satoshi",
+			"1 hour",
+			"&lt;name&gt;.app.example.com",
+			`href="/SKILL.md"`,
+			"https://github.com/akovalenko/usshd",
+		}},
+		{"skill.md.tmpl", []string{
+			"name: usshd-onboarding",
+			"ssh -R80:localhost:<PORT> app@ssh.example.com",
+			"Please pay:",
+			"Your forwarded site:",
+			"1000 sat",
+		}},
+	}
+	for _, c := range cases {
+		var b bytes.Buffer
+		if err := descriptions.ExecuteTemplate(&b, c.tmpl, testConf()); err != nil {
+			t.Fatalf("render %q: %v", c.tmpl, err)
+		}
+		got := b.String()
+		for _, w := range c.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: missing substring %q", c.tmpl, w)
+			}
+		}
+	}
+}
+
+// TestServeLanding drives serveLanding over an in-memory pipe and parses the
+// response back, verifying the hand-rolled HTTP framing (status, content-type,
+// body) for both served paths and the 404 fallback.
+func TestServeLanding(t *testing.T) {
+	uh := &Ushttpd{conf: testConf()}
+	for _, tc := range []struct {
+		path, ctype, want string
+		code              int
+	}{
+		{"/", "text/html", "Share your local web app", 200},
+		{"/SKILL.md", "text/markdown", "usshd-onboarding", 200},
+		{"/nope", "", "", 404},
+	} {
+		cli, srv := net.Pipe()
+		req, err := http.NewRequest("GET", "http://"+uh.conf.LandingHost+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go uh.serveLanding(srv, req)
+		resp, err := http.ReadResponse(bufio.NewReader(cli), req)
+		if err != nil {
+			t.Fatalf("%s: read response: %v", tc.path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cli.Close()
+		if resp.StatusCode != tc.code {
+			t.Errorf("%s: status %d, want %d", tc.path, resp.StatusCode, tc.code)
+		}
+		if tc.ctype != "" && !strings.Contains(resp.Header.Get("Content-Type"), tc.ctype) {
+			t.Errorf("%s: content-type %q, want ~%q", tc.path, resp.Header.Get("Content-Type"), tc.ctype)
+		}
+		if tc.want != "" && !strings.Contains(string(body), tc.want) {
+			t.Errorf("%s: body missing %q", tc.path, tc.want)
+		}
+	}
+}
+
+func TestExpiryText(t *testing.T) {
+	for _, c := range []struct {
+		secs int
+		want string
+	}{
+		{3600, "1 hour"},
+		{7200, "2 hours"},
+		{1800, "30 minutes"},
+		{60, "1 minute"},
+		{45, "45 seconds"},
+	} {
+		got := (&Config{InvoiceExpiry: c.secs}).ExpiryText()
+		if got != c.want {
+			t.Errorf("ExpiryText(%d) = %q, want %q", c.secs, got, c.want)
 		}
 	}
 }

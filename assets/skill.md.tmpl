@@ -1,0 +1,92 @@
+---
+name: usshd-onboarding
+description: Expose a local HTTP application to the public internet as https://<name>.{{.AppDomain}} by paying a one-time Bitcoin Lightning invoice over SSH. Use when the user wants to share a localhost web app, get a public HTTPS URL for a local server, or set up a reverse tunnel to {{.SSHHost}}.
+---
+
+# Expose a local web app via {{.SSHHost}}
+
+This service forwards a local HTTP app to a permanent public subdomain of
+`{{.AppDomain}}`. Identity is your SSH key (any key works — the key's fingerprint
+is the account). Access costs a one-time payment of **{{.Cost}} satoshi** in
+Bitcoin Lightning per key; after that the subdomain is yours for as long as you
+reconnect with the same key. HTTPS is terminated by the service's reverse proxy.
+
+The whole flow is non-interactive (no PTY required), so you can drive it from a
+script or agent.
+
+## Inputs you need
+
+- The **local port** your HTTP app listens on (this guide uses `<PORT>`).
+- An **SSH key** to connect with. Any key is fine; whichever key you use is the
+  identity that the payment (and the subdomain) is bound to. Reuse the same key
+  to keep the same subdomain.
+
+## Step 1 — check status / get the invoice
+
+Connect once with stdin closed and read what the server prints:
+
+```
+ssh -R80:localhost:<PORT> {{.UserHost}} </dev/null
+```
+
+Interpret the output by looking for one of two **stable marker lines**:
+
+- **`Your forwarded site: https://<name>.{{.AppDomain}}`** — this key is already
+  admitted (already paid). The tunnel is up for as long as this SSH process
+  stays connected. You are done onboarding; go to Step 4 to run it persistently.
+- **`Please pay: <bolt11>`** — this key is not admitted yet. Extract the bolt11
+  invoice string from that line, e.g.:
+
+  ```
+  ssh -R80:localhost:<PORT> {{.UserHost}} </dev/null | grep 'Please pay:' | awk '{print $3}'
+  ```
+
+  (The `Please pay:` / `Your forwarded site:` markers are a stability contract —
+  parse those exact prefixes, not the surrounding prose.)
+
+Reconnecting the same key before paying returns the **same** invoice; it does
+not create a new charge.
+
+## Step 2 — pay the invoice (capability-agnostic)
+
+You now have a bolt11 Lightning invoice for **{{.Cost}} sat**, valid for
+{{.ExpiryText}}. How it gets paid depends on your capabilities:
+
+- **If you can pay Lightning invoices yourself** (you have a wallet / CLI / API
+  under your control): pay the bolt11 invoice now.
+- **If you cannot pay autonomously**: present the bolt11 invoice to the user,
+  state the amount (**{{.Cost}} sat**) and that it is valid for {{.ExpiryText}},
+  and **stop**. Continue only after the user confirms they have paid.
+
+Do not invent a payment method you do not actually have — when in doubt, hand the
+invoice to the user.
+
+## Step 3 — confirm admission
+
+After payment, reconnect with the **same key** and confirm the admitted marker:
+
+```
+ssh -R80:localhost:<PORT> {{.UserHost}} </dev/null | grep 'Your forwarded site:'
+```
+
+That line contains your permanent URL: `https://<name>.{{.AppDomain}}`.
+
+## Step 4 — run the tunnel
+
+Bring the forward up and keep it open while you want the site reachable:
+
+```
+ssh -R80:localhost:<PORT> {{.UserHost}} -N
+```
+
+The app is now live at `https://<name>.{{.AppDomain}}`. Notes:
+
+- Port `80` in `-R80:...` is a convention (you forward plain HTTP; the proxy adds
+  HTTPS). Keep it.
+- One active tunnel per subdomain: reconnecting the same key overtakes the older
+  connection.
+- Reconnect any time with the same key to get the same subdomain back.
+
+---
+
+Powered by usshd — {{.SourceURL}}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -34,6 +35,14 @@ type Config struct {
 	// Listeners.
 	ListenSSH  string // LISTEN_SSH
 	ListenHTTP string // LISTEN_HTTP
+
+	// Landing site — the host on which usshd serves the description page and
+	// SKILL.md (see Ushttpd.serveLanding). Defaults to the AppDomain apex; set
+	// it to e.g. description.<AppDomain> to use a subdomain the wildcard route
+	// already covers. Whatever host you pick must be routed to usshd's HTTP
+	// listener by the reverse proxy.
+	LandingHost string // USSHD_LANDING_HOST
+	SourceURL   string // USSHD_SOURCE_URL — "powered by" link on the landing
 }
 
 // UserHost is the "user@host" pair as users type it in ssh — reused across the
@@ -55,6 +64,8 @@ func loadConfig() *Config {
 
 		ListenSSH:  env("LISTEN_SSH", "127.0.0.1:8024"),
 		ListenHTTP: env("LISTEN_HTTP", "127.0.0.1:8088"),
+
+		SourceURL: env("USSHD_SOURCE_URL", "https://github.com/akovalenko/usshd"),
 	}
 	if c.ShortLen < 1 {
 		log.Printf("USSHD_SHORTNAME_LEN must be >= 1, using 4")
@@ -62,7 +73,28 @@ func loadConfig() *Config {
 	}
 	// Memo defaults to the user@host pair, but stays overridable.
 	c.InvoiceMemo = env("USSHD_INVOICE_MEMO", c.UserHost())
+	// Landing defaults to the app-domain apex.
+	c.LandingHost = env("USSHD_LANDING_HOST", c.AppDomain)
 	return c
+}
+
+// ExpiryText renders the invoice lifetime for humans ("1 hour", "30 minutes").
+func (c *Config) ExpiryText() string {
+	switch s := c.InvoiceExpiry; {
+	case s >= 3600 && s%3600 == 0:
+		return plural(s/3600, "hour")
+	case s >= 60 && s%60 == 0:
+		return plural(s/60, "minute")
+	default:
+		return plural(s, "second")
+	}
+}
+
+func plural(n int, unit string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", unit)
+	}
+	return fmt.Sprintf("%d %ss", n, unit)
 }
 
 // env returns the value of key, or def when unset/empty.
@@ -87,13 +119,18 @@ func envInt(key string, def int) int {
 	return n
 }
 
-//go:embed assets/messages.tmpl
+//go:embed assets
 var assetsFS embed.FS
 
-// messages is the parsed user-facing copy, rendered per-session via view.
+// messages is the parsed terminal copy, rendered per-session via view.
 var messages = template.Must(template.New("messages").
 	Funcs(template.FuncMap{"upper": strings.ToUpper}).
 	ParseFS(assetsFS, "assets/messages.tmpl"))
+
+// descriptions are the whole-file templates for the landing site, rendered
+// straight against a *Config. Templates are named by their base filename.
+var descriptions = template.Must(template.New("descriptions").
+	ParseFS(assetsFS, "assets/landing.html.tmpl", "assets/skill.md.tmpl"))
 
 // view is the data a message template renders against: installation fields come
 // from the embedded *Config, the rest are per-session values filled by the
