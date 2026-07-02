@@ -36,6 +36,9 @@ type Config struct {
 	ListenSSH  string // LISTEN_SSH
 	ListenHTTP string // LISTEN_HTTP
 
+	// Storage.
+	DBPath string // USSHD_DB_PATH — sqlite database file (created on first run)
+
 	// Landing site — the host on which usshd serves the description page and
 	// SKILL.md (see Ushttpd.serveLanding). Defaults to the AppDomain apex; set
 	// it to e.g. description.<AppDomain> to use a subdomain the wildcard route
@@ -64,6 +67,8 @@ func loadConfig() *Config {
 
 		ListenSSH:  env("LISTEN_SSH", "127.0.0.1:8024"),
 		ListenHTTP: env("LISTEN_HTTP", "127.0.0.1:8088"),
+
+		DBPath: env("USSHD_DB_PATH", "users.db"),
 
 		SourceURL: env("USSHD_SOURCE_URL", "https://github.com/akovalenko/usshd"),
 	}

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -30,7 +29,6 @@ import (
 	"sync/atomic"
 
 	"github.com/mdp/qrterminal/v3"
-	_ "modernc.org/sqlite"
 	"os/signal"
 	"syscall"
 )
@@ -675,7 +673,7 @@ func main() {
 
 	conf := loadConfig()
 
-	db, err := sql.Open("sqlite", "users.db")
+	db, err := openDB(conf.DBPath)
 	if err != nil {
 		log.Fatal(err)
 	}
