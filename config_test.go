@@ -63,6 +63,28 @@ func TestMessagesRender(t *testing.T) {
 	}
 }
 
+// TestMarkerContracts pins the two machine-parsed stability markers. Scripts,
+// agents and SKILL.md grep for the exact line prefixes "Please pay:" and
+// "Your forwarded site:", so the rendered output must *lead* with them verbatim
+// — not merely contain the payload somewhere (as TestMessagesRender's
+// substring cases do). If either prefix drifts, every downstream parser breaks
+// silently; this test is the tripwire, mirroring the STABILITY CONTRACT comment
+// in assets/messages.tmpl.
+func TestMarkerContracts(t *testing.T) {
+	for _, c := range []struct {
+		name, prefix string
+		v            view
+	}{
+		{"pleasePay", "Please pay: ", view{Bolt11: "lnbc1abc"}},
+		{"site", "Your forwarded site: ", view{ShortName: "jxrz"}},
+	} {
+		got := render(t, c.name, c.v)
+		if !strings.HasPrefix(got, c.prefix) {
+			t.Errorf("%s: render must begin with %q, got %q", c.name, c.prefix, got)
+		}
+	}
+}
+
 // TestDescriptionsRender renders the landing page and SKILL.md against a Config,
 // checking the installation values substitute and the stable markers survive.
 func TestDescriptionsRender(t *testing.T) {
