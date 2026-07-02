@@ -353,6 +353,12 @@ func (sshd *Usshd) serveConn(ctx0 context.Context, conn net.Conn) error {
 	return err
 }
 
+// preInvoiceTimeout bounds the "producing" phase — the wait for lnbits to mint
+// the first invoice (or for the DB to resolve an admitted key). Interrupts are
+// disabled during that phase, so if the payment backend is wedged we must not
+// block the client forever: past this deadline we say so and hang up.
+const preInvoiceTimeout = 20 * time.Second
+
 func (uc *usshConn) ServeSession(ctx0 context.Context, newCh ssh.NewChannel) error {
 
 	ctx, cancel := context.WithCancelCause(ctx0)
@@ -389,25 +395,65 @@ func (uc *usshConn) ServeSession(ctx0 context.Context, newCh ssh.NewChannel) err
 nonLarval:
 	go ssh.DiscardRequests(reqs) // except possible window-change
 
+	// armed is closed by the main loop once the first actionable line (the
+	// invoice, or the subdomain for an already-admitted key) has been printed.
+	// Until then the session is still "producing" its answer and must not be
+	// torn down by the client's stdin closing — a non-interactive client
+	// (ssh host </dev/null | grep 'Please pay:') would otherwise never see it.
+	// Interrupts detected before arming are held and honored the instant we arm.
+	armed := make(chan struct{})
+
+	// waitArmed blocks until the gate is armed, or the session ends first
+	// (timeout / real disconnect). Returns false in the latter case: nothing
+	// left to interrupt.
+	waitArmed := func() bool {
+		select {
+		case <-armed:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	go func() {
+		// onEOF: the client closed its stdin. Honor it as "exit" only once
+		// armed, and — variant B — never while a forward is active: a silent
+		// `ssh -R ... </dev/null` tunnel then lives until a real disconnect,
+		// while an interactive user still exits via the Ctrl+C/Ctrl+D bytes
+		// below or by dropping the connection. haveForwards is read only after
+		// arming, by when a `-R` request has long since registered.
+		onEOF := func(cause error) {
+			if !waitArmed() {
+				return
+			}
+			if uc.haveForwards.Load() {
+				return
+			}
+			cancel(cause)
+		}
+		// onInterrupt: an explicit Ctrl+C/Ctrl+D byte (PTY only). Always tears
+		// the session down once armed, even with a forward active.
+		onInterrupt := func() {
+			if waitArmed() {
+				cancel(nil)
+			}
+		}
 		if haveTerm {
 			for {
 				var buf [128]byte
 				n, err := sess.Read(buf[:])
-				if n > 0 {
-					if bytes.ContainsAny(buf[:n], "\003\004") {
-						cancel(nil)
-						return
-					}
+				if n > 0 && bytes.ContainsAny(buf[:n], "\003\004") {
+					onInterrupt()
+					return
 				}
 				if err != nil {
-					cancel(err)
+					onEOF(err)
 					return
 				}
 			}
 		} else {
 			_, err := io.Copy(io.Discard, sess)
-			cancel(err)
+			onEOF(err)
 		}
 	}()
 
@@ -426,6 +472,11 @@ nonLarval:
 	defer uc.sshd.biller.Unsubscribe(usub)
 
 	printedIntro := false
+	gateArmed := false
+
+	invoiceTimeout := time.NewTimer(preInvoiceTimeout)
+	defer invoiceTimeout.Stop()
+	timeoutC := invoiceTimeout.C
 
 	for {
 		select {
@@ -440,9 +491,23 @@ nonLarval:
 				}
 			}
 			uc.printUserRec(stdout, rec, term.W, term.H)
+			if rec.Bolt11 != "" || rec.ShortName != "" {
+				// First actionable line is out: arm interrupts and retire the
+				// pre-invoice timeout — a pending payment may take arbitrarily
+				// long (bounded only by the invoice's own expiry).
+				if !gateArmed {
+					close(armed)
+					gateArmed = true
+				}
+				invoiceTimeout.Stop()
+				timeoutC = nil
+			}
 			if rec.ShortName != "" {
 				goto finish
 			}
+		case <-timeoutC:
+			fmt.Fprint(stdout, "\nPayment backend is not responding, please try again later.\n")
+			goto cancelling
 		case <-ctx.Done():
 			goto cancelling
 		}
