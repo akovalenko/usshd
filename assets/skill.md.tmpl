@@ -1,6 +1,6 @@
 ---
 name: usshd-onboarding
-description: Expose a local HTTP application to the public internet as https://<name>.{{.AppDomain}} by paying a one-time Bitcoin Lightning invoice over SSH. Use when the user wants to share a localhost web app, get a public HTTPS URL for a local server, or set up a reverse tunnel to {{.SSHHost}}.
+description: Expose a local HTTP application to the public internet as https://<name>.{{.AppDomain}} by paying a one-time Bitcoin Lightning invoice over SSH — or just look up the subdomain already bound to your SSH key. Use when the user wants to share a localhost web app, get a public HTTPS URL for a local server, set up a reverse tunnel to {{.SSHHost}}, or find their existing subdomain.
 ---
 
 # Expose a local web app via {{.SSHHost}}
@@ -12,33 +12,38 @@ Bitcoin Lightning per key; after that the subdomain is yours for as long as you
 reconnect with the same key. HTTPS is terminated by the service's reverse proxy.
 
 The whole flow is non-interactive (no PTY required), so you can drive it from a
-script or agent.
+script or agent. You can also just **look up the subdomain bound to your key
+without serving anything** — see Step 1.
 
 ## Inputs you need
 
-- The **local port** your HTTP app listens on (this guide uses `<PORT>`).
-- An **SSH key** to connect with. Any key is fine; whichever key you use is the
-  identity that the payment (and the subdomain) is bound to. Reuse the same key
-  to keep the same subdomain.
+- An **SSH key** to connect with — always required. Any key is fine; whichever
+  key you use is the identity that the payment (and the subdomain) is bound to.
+  Reuse the same key to keep the same subdomain.
+- The **local port** your HTTP app listens on (this guide calls it `<PORT>`) —
+  needed **only if you actually want to serve an app** (Step 4). To check status,
+  look up your subdomain, or pay, no port is needed.
 
-## Step 1 — check status / get the invoice
+## Step 1 — check status: your subdomain, or an invoice
 
-Connect once with stdin closed and read what the server prints:
+Connect once with stdin closed and read what the server prints. This sets up **no
+forward** — it is a pure status check, so **no port is needed**:
 
 ```
-ssh -R80:localhost:<PORT> {{.UserHost}} </dev/null
+ssh {{.UserHost}} </dev/null
 ```
 
 Interpret the output by looking for one of two **stable marker lines**:
 
 - **`Your forwarded site: https://<name>.{{.AppDomain}}`** — this key is already
-  admitted (already paid). The tunnel is up for as long as this SSH process
-  stays connected. You are done onboarding; go to Step 4 to run it persistently.
+  admitted (already paid). That line contains your permanent subdomain. If you
+  only wanted to find your subdomain, **you are done** — there is nothing else to
+  do. To actually serve a local app on it, go to Step 4.
 - **`Please pay: <bolt11>`** — this key is not admitted yet. Extract the bolt11
   invoice string from that line, e.g.:
 
   ```
-  ssh -R80:localhost:<PORT> {{.UserHost}} </dev/null | grep 'Please pay:' | awk '{print $3}'
+  ssh {{.UserHost}} </dev/null | grep 'Please pay:' | awk '{print $3}'
   ```
 
   (The `Please pay:` / `Your forwarded site:` markers are a stability contract —
@@ -63,17 +68,25 @@ invoice to the user.
 
 ## Step 3 — confirm admission
 
-After payment, reconnect with the **same key** and confirm the admitted marker:
+After payment, reconnect with the **same key** and confirm the admitted marker
+(still a status check, so no port needed):
 
 ```
-ssh -R80:localhost:<PORT> {{.UserHost}} </dev/null | grep 'Your forwarded site:'
+ssh {{.UserHost}} </dev/null | grep 'Your forwarded site:'
 ```
 
 That line contains your permanent URL: `https://<name>.{{.AppDomain}}`.
 
-## Step 4 — run the tunnel
+## Step 4 — run the tunnel (only when serving an app)
 
-Bring the forward up and keep it open while you want the site reachable:
+**Do this step only if the user actually wants to expose a local application** —
+that is, they have told you *which* app to serve and *which* local port it
+listens on. If the user only wanted their subdomain, or has not said what to
+serve or where, **stop after Step 1/3**: you already have the URL from the
+`Your forwarded site:` line, and there is nothing to forward.
+
+When you do have an app listening on `<PORT>`, bring the forward up and keep it
+open for as long as you want the site reachable:
 
 ```
 ssh -R80:localhost:<PORT> {{.UserHost}} -N
