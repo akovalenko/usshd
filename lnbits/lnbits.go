@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"time"
 
-	"github.com/r3labs/sse"
+	"github.com/coder/websocket"
 	"gopkg.in/cenkalti/backoff.v1"
 )
 
@@ -168,30 +170,94 @@ func (c *Client) GetInvoice(ctx context.Context, ph string) (*InvoiceData, error
 	return iData, nil
 }
 
+// wsPayment mirrors the payment-notification frame lnbits pushes over the
+// websocket channel /api/v1/ws/<key>: {"wallet_balance": N, "payment": {...}}.
+// Only the fields we consume are declared; unlisted JSON keys (time, expiry,
+// extra — which carry non-int types) are ignored so they can't break decoding.
+type wsPayment struct {
+	Payment struct {
+		PaymentHash string `json:"payment_hash"`
+		Amount      int64  `json:"amount"` // msat; negative for outgoing
+		Memo        string `json:"memo"`
+		Bolt11      string `json:"bolt11"`
+		Preimage    string `json:"preimage"`
+	} `json:"payment"`
+}
+
+// Subscribe streams payment notifications for the wallet identified by ApiKey.
+// lnbits removed the old SSE endpoint (/api/v1/payments/sse) in the 1.x line;
+// real-time now flows over a websocket at /api/v1/ws/<key>, where every frame
+// on the channel is a payment for that wallet (both directions). We preserve
+// the original SSE semantics — fire the handler only for incoming payments —
+// by filtering on a positive amount. The call blocks until ctx is cancelled,
+// reconnecting with exponential backoff so a dropped socket is not fatal.
 func (c *Client) Subscribe(ctx context.Context, handler func(*InvoiceEventData)) error {
-	clnt := sse.NewClient(c.Url + "/api/v1/payments/sse")
+	wsURL := c.Url
+	if strings.HasPrefix(wsURL, "https://") {
+		wsURL = "wss://" + strings.TrimPrefix(wsURL, "https://")
+	} else if strings.HasPrefix(wsURL, "http://") {
+		wsURL = "ws://" + strings.TrimPrefix(wsURL, "http://")
+	}
+	wsURL += "/api/v1/ws/" + c.ApiKey
 
-	rs := backoff.NewExponentialBackOff()
-	bofc := backoff.WithContext(rs, ctx)
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxElapsedTime = 0 // reconnect indefinitely, like the old SSE client
 
-	clnt.ReconnectStrategy = bofc
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		c.subscribeOnce(ctx, wsURL, handler, bo)
+		if ctx.Err() != nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(bo.NextBackOff()):
+		}
+	}
+}
 
-	clnt.Headers["X-Api-Key"] = c.ApiKey
-	return clnt.SubscribeWithContext(ctx,"",
-		func(msg *sse.Event) {
-			if string(msg.Event) != "payment-received" {
-				return
-			}
-			var v *InvoiceEventData
-			err := json.Unmarshal(msg.Data, &v)
-			if err != nil {
-				return
-			}
-			if v == nil {
-				return
-			}
-			handler(v)
+// subscribeOnce holds one websocket connection open, dispatching incoming
+// payments until the socket errors or ctx is cancelled. Backoff is reset only
+// after a frame is actually read, so an endpoint that accepts then immediately
+// drops keeps escalating the reconnect delay instead of hot-looping.
+func (c *Client) subscribeOnce(ctx context.Context, wsURL string,
+	handler func(*InvoiceEventData), bo *backoff.ExponentialBackOff) {
+
+	conn, _, err := websocket.Dial(ctx, wsURL,
+		&websocket.DialOptions{HTTPClient: c.httpClient()})
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(1 << 20)
+
+	firstRead := true
+	for {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
 			return
-		},
-	)
+		}
+		if firstRead {
+			bo.Reset()
+			firstRead = false
+		}
+		var msg wsPayment
+		if json.Unmarshal(data, &msg) != nil {
+			continue
+		}
+		p := msg.Payment
+		if p.PaymentHash == "" || p.Amount <= 0 {
+			continue // skip malformed frames and outgoing payments
+		}
+		handler(&InvoiceEventData{
+			PaymentHash: p.PaymentHash,
+			Amount:      p.Amount,
+			Memo:        p.Memo,
+			Bolt11:      p.Bolt11,
+			Preimage:    p.Preimage,
+		})
+	}
 }
