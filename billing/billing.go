@@ -304,7 +304,7 @@ func (b *Billing) dbInterested(ctx context.Context, u string) error {
 	invData, err := b.lnbc.GetInvoice(ctx, *payhash)
 	if err != nil {
 		if errors.Is(err, lnbits.ErrNotFound) {
-			// expired
+			// legacy path: older lnbits deleted expired invoices (404)
 			return b.dbReinvoiceUser(ctx, u)
 		}
 		return err
@@ -312,6 +312,11 @@ func (b *Billing) dbInterested(ctx context.Context, u string) error {
 
 	if invData.Paid {
 		return b.dbAdmitUser(ctx, u)
+	}
+	if invoiceDead(invData) {
+		// lnbits 1.x keeps expired invoices (flipped to failed) rather than
+		// deleting them, so this replaces the vanished-invoice 404 above.
+		return b.dbReinvoiceUser(ctx, u)
 	}
 	b.uc.Put(&UserRecord{
 		Id:      u,
@@ -414,6 +419,17 @@ func (b *Billing) gotPaid(ied *lnbits.InvoiceEventData) {
 	}
 }
 
+// invoiceDead reports whether a fetched invoice can never be paid and should be
+// replaced. lnbits 1.x stopped deleting expired invoices — it flips them
+// pending->failed and keeps the row — so GetInvoice returns 200
+// {paid:false, status:"failed"} where 0.x returned a 404. A non-empty status
+// other than pending means the node has cancelled the invoice: it is unpayable
+// externally and on-us alike (lnbits matches only pending invoices for internal
+// payment), so reinvoicing cannot race a still-live payment.
+func invoiceDead(inv *lnbits.InvoiceData) bool {
+	return !inv.Paid && inv.Status != "" && inv.Status != lnbits.StatusPending
+}
+
 func (b *Billing) check(ctx context.Context) error {
 	ct := b.uc.Content()
 	for _, rec := range ct {
@@ -430,6 +446,10 @@ func (b *Billing) check(ctx context.Context) error {
 		}
 		if invData.Paid {
 			b.paid <- rec.Id
+			continue
+		}
+		if invoiceDead(invData) {
+			b.expired <- rec.Id
 		}
 	}
 	return nil

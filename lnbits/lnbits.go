@@ -124,6 +124,14 @@ func roundtrip[T any](c *Client, ctx context.Context, path string,
 var ErrParseJson = errors.New("lnbits reply json fields unparseable")
 var ErrNotFound = errors.New("lnbits gives 404 Not found")
 
+// StatusPending is the lnbits payment status of an unsettled invoice. Any other
+// non-empty status on an unpaid invoice — notably "failed", to which lnbits 1.x
+// flips an expired invoice instead of deleting it — means the invoice is
+// terminally unpayable. (lnbits serialises the status enum, so a just-flipped
+// invoice may report "PaymentState.FAILED" rather than "failed" on the first
+// read; keying on "not pending" rather than "== failed" is robust to that.)
+const StatusPending = "pending"
+
 func (c *Client) AddInvoice(ctx context.Context,
 	amount int, memo string, expiry int, unit string) (
 	ph string, pr string, er error) {
