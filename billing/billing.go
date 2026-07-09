@@ -223,10 +223,8 @@ func (b *Billing) Serve(ctx0 context.Context) error {
 			t := time.NewTimer(15 * time.Second)
 			select {
 			case <-t.C:
-				err := b.check(ctx)
-				if err != nil {
-					cancel(err)
-					return
+				if err := b.check(ctx); err != nil {
+					log.Printf("billing: check: %v", err)
 				}
 			case <-ctx.Done():
 				return
@@ -257,15 +255,15 @@ func (b *Billing) serveDb(ctx context.Context) error {
 		select {
 		case u := <-b.interested:
 			if err := b.dbInterested(ctx, u); err != nil {
-				return err
+				log.Printf("billing: interested %s: %v", u, err)
 			}
 		case u := <-b.paid:
 			if err := b.dbAdmitUser(ctx, u); err != nil {
-				return err
+				log.Printf("billing: admit %s: %v", u, err)
 			}
 		case u := <-b.expired:
 			if err := b.dbReinvoiceUser(ctx, u); err != nil {
-				return err
+				log.Printf("billing: reinvoice %s: %v", u, err)
 			}
 		case <-ctx.Done():
 			return nil
