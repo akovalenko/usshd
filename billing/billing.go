@@ -422,10 +422,14 @@ func (b *Billing) gotPaid(ied *lnbits.InvoiceEventData) {
 // invoiceDead reports whether a fetched invoice can never be paid and should be
 // replaced. lnbits 1.x stopped deleting expired invoices — it flips them
 // pending->failed and keeps the row — so GetInvoice returns 200
-// {paid:false, status:"failed"} where 0.x returned a 404. A non-empty status
-// other than pending means the node has cancelled the invoice: it is unpayable
-// externally and on-us alike (lnbits matches only pending invoices for internal
-// payment), so reinvoicing cannot race a still-live payment.
+// {paid:false, status:"failed"} where 0.x returned a 404. Paid invoices are
+// handled before this, so an unpaid invoice whose status is neither pending nor
+// empty is terminal (node-cancelled): unpayable externally and on-us alike
+// (lnbits matches only pending invoices for internal payment), so reinvoicing
+// cannot race a still-live payment. Testing "not pending" rather than
+// "== failed" avoids hardcoding lnbits's terminal string and covers any future
+// terminal state; the empty-status guard skips lnbits's no-status responses,
+// where the state is unknown.
 func invoiceDead(inv *lnbits.InvoiceData) bool {
 	return !inv.Paid && inv.Status != "" && inv.Status != lnbits.StatusPending
 }

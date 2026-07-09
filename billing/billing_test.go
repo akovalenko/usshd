@@ -7,9 +7,10 @@ import (
 )
 
 // TestInvoiceDead pins the reinvoice decision for a fetched (non-error) invoice.
-// The trigger is "unpaid and not pending", not "== failed", because lnbits
-// serialises the status enum and a just-flipped invoice can report
-// "PaymentState.FAILED" on the first read before settling to "failed".
+// The trigger is "unpaid and not pending" rather than "== failed": paid invoices
+// are handled earlier, so any non-empty, non-pending status is terminal (lnbits
+// reports an expired/cancelled invoice as "failed"). Matching "not pending" also
+// catches any other terminal status without hardcoding a literal.
 func TestInvoiceDead(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -21,7 +22,7 @@ func TestInvoiceDead(t *testing.T) {
 		{"paid", true, "", false},
 		{"paid-with-status", true, "success", false},
 		{"failed", false, "failed", true},
-		{"failed-enum-str", false, "PaymentState.FAILED", true},
+		{"other-terminal", false, "cancelled", true},
 		{"unknown-empty-status", false, "", false},
 	}
 	for _, c := range cases {
