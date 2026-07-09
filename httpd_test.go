@@ -2,103 +2,196 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-func parseReq(t *testing.T, raw string) *http.Request {
-	t.Helper()
-	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(raw)))
+// tcpForwarder backs a Forwarder with a plain TCP dial to a test server,
+// standing in for the SSH-channel dial of a live tunnel.
+type tcpForwarder struct {
+	addr string
+}
+
+func (f *tcpForwarder) Dial(originHost string, originPort uint32) (net.Conn, error) {
+	return net.Dial("tcp", f.addr)
+}
+
+func (f *tcpForwarder) Overtake() {}
+
+// TestProxyRoutesPerRequest pins the per-request routing contract: requests
+// arriving over ONE keep-alive front connection but bearing different
+// x-forwarded-host values must reach their respective tunnels, and an
+// unknown host must get 502 — never someone else's backend. (The previous
+// splice design routed once per connection; a pooling front proxy then fed
+// every subdomain into whichever tunnel the connection was first routed to.)
+func TestProxyRoutesPerRequest(t *testing.T) {
+	echoHost := func(tag string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "%s:%s", tag, r.Host)
+		})
+	}
+	backendA := httptest.NewServer(echoHost("A"))
+	defer backendA.Close()
+	backendB := httptest.NewServer(echoHost("B"))
+	defer backendB.Close()
+
+	uh := newUshttpd(nil)
+	uh.RegisterForwarder("a.app.example",
+		&tcpForwarder{addr: backendA.Listener.Addr().String()})
+	uh.RegisterForwarder("b.app.example",
+		&tcpForwarder{addr: backendB.Listener.Addr().String()})
+
+	front := httptest.NewServer(uh)
+	defer front.Close()
+
+	// One client with keep-alive: connections to the front are reused
+	// across requests, like Caddy's upstream pool.
+	client := front.Client()
+	get := func(host string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest("GET", front.URL+"/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// model Caddy: original Host preserved, x-forwarded-host set
+		req.Host = host
+		req.Header.Set("X-Forwarded-Host", host)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(body)
+	}
+
+	for i := 0; i < 3; i++ {
+		if code, body := get("a.app.example"); code != 200 || body != "A:a.app.example" {
+			t.Fatalf("host a: got %d %q", code, body)
+		}
+		if code, body := get("b.app.example"); code != 200 || body != "B:b.app.example" {
+			t.Fatalf("host b: got %d %q", code, body)
+		}
+		if code, _ := get("nosuch.app.example"); code != http.StatusBadGateway {
+			t.Fatalf("unknown host: got %d, want 502", code)
+		}
+	}
+}
+
+// TestProxyUpgradePassthrough drives a protocol upgrade (the websocket shape)
+// through the proxy: the 101 handshake must reach the client and the
+// connection must turn into a transparent bidirectional pipe.
+func TestProxyUpgradePassthrough(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Upgrade") != "echo" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			conn, buf, err := http.NewResponseController(w).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			buf.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
+				"Connection: Upgrade\r\nUpgrade: echo\r\n\r\n")
+			buf.Flush()
+			io.Copy(conn, buf) // echo
+		}))
+	defer backend.Close()
+
+	uh := newUshttpd(nil)
+	uh.RegisterForwarder("a.app.example",
+		&tcpForwarder{addr: backend.Listener.Addr().String()})
+	front := httptest.NewServer(uh)
+	defer front.Close()
+
+	conn, err := net.Dial("tcp", front.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return req
-}
-
-// TestForceConnClose pins the one-shot contract of forwarded requests: the
-// head passed into the tunnel must demand Connection: close (so the backend
-// hangs up after one response and the front proxy cannot pool the spliced
-// connection for other subdomains), while everything past the head — body
-// bytes the header read may have buffered — passes through unchanged.
-func TestForceConnClose(t *testing.T) {
-	raw := "POST /x HTTP/1.1\r\n" +
-		"Host: front\r\n" +
-		"Connection: keep-alive\r\n" +
-		"Proxy-Connection: keep-alive\r\n" +
-		"Content-Length: 4\r\n" +
-		"\r\n" +
-		"body"
-	got := string(forceConnClose([]byte(raw), parseReq(t, raw)))
-
-	head, body, found := strings.Cut(got, "\r\n\r\n")
-	if !found {
-		t.Fatalf("no header terminator in %q", got)
-	}
-	if body != "body" {
-		t.Fatalf("body corrupted: %q", body)
-	}
-	if strings.Contains(strings.ToLower(head), "keep-alive") {
-		t.Fatalf("keep-alive survived: %q", head)
-	}
-	if !strings.HasSuffix(head, "Connection: close") {
-		t.Fatalf("no Connection: close in %q", head)
-	}
-	if !strings.HasPrefix(head, "POST /x HTTP/1.1\r\n") {
-		t.Fatalf("request line corrupted: %q", head)
-	}
-}
-
-// TestForceConnCloseUpgrade pins that upgrade handshakes pass untouched — a
-// websocket connection must not be demoted to one-shot.
-func TestForceConnCloseUpgrade(t *testing.T) {
-	raw := "GET /ws HTTP/1.1\r\n" +
-		"Host: front\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Upgrade: websocket\r\n" +
-		"\r\n"
-	if got := string(forceConnClose([]byte(raw), parseReq(t, raw))); got != raw {
-		t.Fatalf("upgrade request modified: %q", got)
-	}
-}
-
-type captureForwarder struct {
-	hdr chan []byte
-}
-
-func (c *captureForwarder) Pass(conn net.Conn, hdr []byte) {
-	conn.Close()
-	c.hdr <- hdr
-}
-
-func (c *captureForwarder) Overtake() {}
-
-// TestHandleConnForwardsOneShot drives handleConn end to end: the head that
-// reaches the registered forwarder carries Connection: close.
-func TestHandleConnForwardsOneShot(t *testing.T) {
-	fwd := &captureForwarder{hdr: make(chan []byte, 1)}
-	uh := &Ushttpd{forwarders: map[string]Forwarder{
-		"abcd.app.example": fwd,
-	}}
-	client, server := net.Pipe()
-	defer client.Close()
-	go uh.handleConn(server)
-
-	raw := "GET / HTTP/1.1\r\n" +
-		"Host: front\r\n" +
-		"X-Forwarded-Host: abcd.app.example\r\n" +
-		"Connection: keep-alive\r\n" +
-		"\r\n"
-	if _, err := client.Write([]byte(raw)); err != nil {
+	defer conn.Close()
+	_, err = conn.Write([]byte("GET / HTTP/1.1\r\n" +
+		"Host: a.app.example\r\n" +
+		"X-Forwarded-Host: a.app.example\r\n" +
+		"Connection: Upgrade\r\nUpgrade: echo\r\n\r\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	hdr := <-fwd.hdr
-	if !bytes.Contains(hdr, []byte("Connection: close")) {
-		t.Fatalf("forwarded head lacks Connection: close: %q", hdr)
+
+	rd := bufio.NewReader(conn)
+	status, err := rd.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
 	}
-	if bytes.Contains(bytes.ToLower(hdr), []byte("keep-alive")) {
-		t.Fatalf("keep-alive leaked into tunnel: %q", hdr)
+	if !strings.Contains(status, "101") {
+		t.Fatalf("status line %q, want 101", status)
+	}
+	for { // skip response headers
+		line, err := rd.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	echo := make([]byte, 4)
+	if _, err := io.ReadFull(rd, echo); err != nil {
+		t.Fatal(err)
+	}
+	if string(echo) != "ping" {
+		t.Fatalf("echo %q, want %q", echo, "ping")
+	}
+}
+
+// TestProxyKeepsForwardedHeaders pins that the front proxy's X-Forwarded-*
+// headers reach the backend verbatim (ReverseProxy.Rewrite strips them by
+// default; parity with the raw splice requires handing them through).
+func TestProxyKeepsForwardedHeaders(t *testing.T) {
+	headers := make(chan http.Header, 1)
+	backend := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			headers <- r.Header.Clone()
+		}))
+	defer backend.Close()
+
+	uh := newUshttpd(nil)
+	uh.RegisterForwarder("a.app.example",
+		&tcpForwarder{addr: backend.Listener.Addr().String()})
+	front := httptest.NewServer(uh)
+	defer front.Close()
+
+	req, err := http.NewRequest("GET", front.URL+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Forwarded-Host", "a.app.example")
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	resp, err := front.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	got := <-headers
+	for h, want := range map[string]string{
+		"X-Forwarded-Host":  "a.app.example",
+		"X-Forwarded-For":   "203.0.113.7",
+		"X-Forwarded-Proto": "https",
+	} {
+		if v := got.Get(h); v != want {
+			t.Errorf("%s = %q, want %q", h, v, want)
+		}
 	}
 }

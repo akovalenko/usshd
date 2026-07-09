@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"io"
-	"net"
-	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -123,11 +121,11 @@ func TestDescriptionsRender(t *testing.T) {
 	}
 }
 
-// TestServeLanding drives serveLanding over an in-memory pipe and parses the
-// response back, verifying the hand-rolled HTTP framing (status, content-type,
-// body) for both served paths and the 404 fallback.
+// TestServeLanding drives the landing pages through ServeHTTP (routed by
+// x-forwarded-host), verifying status, content-type and body for both served
+// paths and the 404 fallback.
 func TestServeLanding(t *testing.T) {
-	uh := &Ushttpd{conf: testConf()}
+	uh := newUshttpd(testConf())
 	for _, tc := range []struct {
 		path, ctype, want string
 		code              int
@@ -136,19 +134,13 @@ func TestServeLanding(t *testing.T) {
 		{"/SKILL.md", "text/markdown", "usshd-onboarding", 200},
 		{"/nope", "", "", 404},
 	} {
-		cli, srv := net.Pipe()
-		req, err := http.NewRequest("GET", "http://"+uh.conf.LandingHost+tc.path, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		go uh.serveLanding(srv, req)
-		resp, err := http.ReadResponse(bufio.NewReader(cli), req)
-		if err != nil {
-			t.Fatalf("%s: read response: %v", tc.path, err)
-		}
+		req := httptest.NewRequest("GET", "http://front"+tc.path, nil)
+		req.Header.Set("X-Forwarded-Host", uh.conf.LandingHost)
+		rec := httptest.NewRecorder()
+		uh.ServeHTTP(rec, req)
+		resp := rec.Result()
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		cli.Close()
 		if resp.StatusCode != tc.code {
 			t.Errorf("%s: status %d, want %d", tc.path, resp.StatusCode, tc.code)
 		}

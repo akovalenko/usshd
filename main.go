@@ -1,14 +1,15 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"strconv"
 	"strings"
@@ -66,19 +67,6 @@ func netAddrIp(a net.Addr) string {
 	return hostPort[:colon]
 }
 
-func netAddrIpPort(a net.Addr) (string, uint32) {
-	hostPort := a.String()
-	colon := strings.LastIndexByte(hostPort, ':')
-	if colon == -1 {
-		return "0.0.0.0", 0
-	}
-	port, err := strconv.Atoi(hostPort[colon+1:])
-	if err != nil {
-		return hostPort[:colon], 0
-	}
-	return hostPort[:colon], uint32(port)
-}
-
 // makeAuthCallback accepts any public key, provided the login name matches the
 // installation's configured SSH user. Identity is the key's sha256 fingerprint.
 func makeAuthCallback(user string) func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
@@ -125,15 +113,96 @@ func (c *CrWriter) Write(p []byte) (int, error) {
 	}
 }
 
+// Forwarder is one live tunnel: Dial opens a fresh stream to the tunneled
+// backend (a forwarded-tcpip channel), Overtake is called when a newer
+// connection claims the same shortname.
 type Forwarder interface {
-	Pass(net.Conn, []byte)
+	Dial(originHost string, originPort uint32) (net.Conn, error)
 	Overtake()
 }
 
+// Ushttpd is a per-request reverse proxy: every request is routed by its own
+// x-forwarded-host, so the front proxy (Caddy) may keep-alive and pool its
+// connections to us freely. (A previous design routed once per TCP connection
+// and spliced the rest raw — a pooling front proxy then reused a spliced
+// connection for other subdomains, serving one user's tunnel for every
+// shortname.) The Transport below pools backend streams BY TARGET HOST, so
+// tunnel keep-alive cannot cross subdomains structurally.
 type Ushttpd struct {
 	conf       *Config
 	mu         sync.Mutex
 	forwarders map[string]Forwarder
+	transport  *http.Transport
+	proxy      *httputil.ReverseProxy
+}
+
+// originKey carries the front proxy's address (the socket the request came in
+// on) from ServeHTTP to dialTunnel, which reports it as the forwarded-tcpip
+// originator. With pooling this is best-effort — a reused stream keeps the
+// originator that first opened it; the per-request truth stays in
+// X-Forwarded-For.
+type originKey struct{}
+
+func newUshttpd(conf *Config) *Ushttpd {
+	uh := &Ushttpd{
+		conf:       conf,
+		forwarders: make(map[string]Forwarder),
+	}
+	uh.transport = &http.Transport{
+		DialContext:         uh.dialTunnel,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	uh.proxy = &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			host := strings.ToLower(pr.In.Header.Get("x-forwarded-host"))
+			pr.Out.URL.Scheme = "http"
+			pr.Out.URL.Host = host
+			pr.Out.Host = pr.In.Host
+			// ReverseProxy strips Forwarded/X-Forwarded-* before Rewrite;
+			// hand the front proxy's originals through verbatim, like the
+			// raw splice this proxy replaced did.
+			for _, h := range []string{"Forwarded", "X-Forwarded-For",
+				"X-Forwarded-Host", "X-Forwarded-Proto"} {
+				if v := pr.In.Header.Values(h); len(v) > 0 {
+					pr.Out.Header[h] = v
+				}
+			}
+		},
+		Transport:     uh.transport,
+		FlushInterval: -1, // flush as the tunnel speaks: SSE etc. stay live
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("proxy %s: %v", r.Header.Get("x-forwarded-host"), err)
+			w.WriteHeader(http.StatusBadGateway)
+		},
+	}
+	return uh
+}
+
+// dialTunnel resolves the target host to a live tunnel and opens a stream
+// into it. Runs on the Transport's schedule: once per pooled connection, not
+// once per request.
+func (uh *Ushttpd) dialTunnel(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	uh.mu.Lock()
+	fwd, ok := uh.forwarders[host]
+	uh.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("no tunnel for %v", host)
+	}
+	originHost, originPort := "0.0.0.0", uint32(0)
+	if origin, ok := ctx.Value(originKey{}).(string); ok {
+		if h, p, err := net.SplitHostPort(origin); err == nil {
+			originHost = h
+			if pn, err := strconv.Atoi(p); err == nil {
+				originPort = uint32(pn)
+			}
+		}
+	}
+	return fwd.Dial(originHost, originPort)
 }
 
 func (uh *Ushttpd) ListenAndServe(ctx0 context.Context, addr string) error {
@@ -145,17 +214,33 @@ func (uh *Ushttpd) ListenAndServe(ctx0 context.Context, addr string) error {
 	ctx, cancel := context.WithCancel(ctx0)
 	defer cancel()
 
+	srv := &http.Server{Handler: uh}
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		srv.Close()
 	}()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go uh.handleConn(conn)
+	err = srv.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
 	}
+	return err
+}
+
+func (uh *Ushttpd) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	host := strings.ToLower(r.Header.Get("x-forwarded-host"))
+	if uh.conf != nil && host == strings.ToLower(uh.conf.LandingHost) {
+		uh.serveLanding(w, r)
+		return
+	}
+	uh.mu.Lock()
+	_, ok := uh.forwarders[host]
+	uh.mu.Unlock()
+	if !ok {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	r = r.WithContext(context.WithValue(r.Context(), originKey{}, r.RemoteAddr))
+	uh.proxy.ServeHTTP(w, r)
 }
 
 func (uh *Ushttpd) RegisterForwarder(host string, io Forwarder) {
@@ -165,6 +250,9 @@ func (uh *Ushttpd) RegisterForwarder(host string, io Forwarder) {
 	uh.mu.Unlock()
 	if ok {
 		old.Overtake()
+		// pooled streams into the overtaken connection are dead; drop them
+		// now rather than letting requests trip over them
+		uh.transport.CloseIdleConnections()
 	}
 }
 
@@ -176,115 +264,27 @@ func (uh *Ushttpd) RemoveForwarder(host string, io Forwarder) {
 	uh.mu.Unlock()
 }
 
-func (uh *Ushttpd) sayStatus(conn net.Conn, code int) {
-	resp := &http.Response{
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		StatusCode: code,
-		Status:     http.StatusText(code),
-		Close:      true,
-	}
-	resp.Write(conn)
-	conn.Close()
-}
-
-func (uh *Ushttpd) Say502(conn net.Conn) {
-	uh.sayStatus(conn, http.StatusBadGateway)
-}
-
 // serveLanding answers the landing host itself (the description page and
 // SKILL.md), rendering the whole-file templates against the installation config.
-func (uh *Ushttpd) serveLanding(conn net.Conn, req *http.Request) {
-	defer conn.Close()
+func (uh *Ushttpd) serveLanding(w http.ResponseWriter, r *http.Request) {
 	var tmpl, ctype string
-	switch req.URL.Path {
+	switch r.URL.Path {
 	case "/", "/index.html":
 		tmpl, ctype = "landing.html.tmpl", "text/html; charset=utf-8"
 	case "/SKILL.md":
 		tmpl, ctype = "skill.md.tmpl", "text/markdown; charset=utf-8"
 	default:
-		uh.sayStatus(conn, http.StatusNotFound)
+		http.NotFound(w, r)
 		return
 	}
 	var body bytes.Buffer
 	if err := descriptions.ExecuteTemplate(&body, tmpl, uh.conf); err != nil {
 		log.Printf("render %s: %v", tmpl, err)
-		uh.sayStatus(conn, http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	h := http.Header{}
-	h.Set("Content-Type", ctype)
-	resp := &http.Response{
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		StatusCode:    http.StatusOK,
-		Status:        http.StatusText(http.StatusOK),
-		Header:        h,
-		Body:          io.NopCloser(&body),
-		ContentLength: int64(body.Len()),
-		Close:         true,
-	}
-	resp.Write(conn)
-}
-
-func (uh *Ushttpd) handleConn(conn net.Conn) {
-	hbuff := &bytes.Buffer{}
-	hread := io.TeeReader(conn, hbuff)
-	req, err := http.ReadRequest(bufio.NewReader(hread))
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	host := req.Header.Get("x-forwarded-host")
-	host = strings.ToLower(host)
-	if uh.conf != nil && host == strings.ToLower(uh.conf.LandingHost) {
-		uh.serveLanding(conn, req)
-		return
-	}
-	uh.mu.Lock()
-	fwd, ok := uh.forwarders[host]
-	uh.mu.Unlock()
-	if !ok {
-		uh.Say502(conn)
-		return
-	}
-	fwd.Pass(conn, forceConnClose(hbuff.Bytes(), req))
-}
-
-// forceConnClose patches the buffered request head to carry
-// "Connection: close". Routing here is per-connection: the first request's
-// x-forwarded-host picks the tunnel and the rest of the connection is
-// spliced into it raw. If the tunneled backend answered keep-alive, a
-// pooling front proxy (Caddy) would return the spliced connection to its
-// per-upstream idle pool and reuse it for later requests to ARBITRARY
-// subdomains, tunneling them past routing entirely. Closing after one
-// response makes the proxy open a fresh — freshly routed — connection per
-// request. Upgrade handshakes (websockets) pass through untouched: an
-// upgraded connection is dedicated to one client and never pooled.
-func forceConnClose(raw []byte, req *http.Request) []byte {
-	if req.Header.Get("Upgrade") != "" ||
-		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade") {
-		return raw
-	}
-	head, rest, found := bytes.Cut(raw, []byte("\r\n\r\n"))
-	if !found {
-		return raw
-	}
-	lines := bytes.Split(head, []byte("\r\n"))
-	out := make([][]byte, 0, len(lines)+1)
-	for i, line := range lines {
-		if i > 0 {
-			l := bytes.ToLower(line)
-			if bytes.HasPrefix(l, []byte("connection:")) ||
-				bytes.HasPrefix(l, []byte("proxy-connection:")) {
-				continue
-			}
-		}
-		out = append(out, line)
-	}
-	out = append(out, []byte("Connection: close"))
-	patched := bytes.Join(out, []byte("\r\n"))
-	return append(append(patched, "\r\n\r\n"...), rest...)
+	w.Header().Set("Content-Type", ctype)
+	w.Write(body.Bytes())
 }
 
 type Usshd struct {
@@ -634,10 +634,22 @@ func (uc *usshConn) HandleForwarding(ctx context.Context, req *ssh.Request) erro
 	return nil
 }
 
-func (uc *usshConn) Pass(conn net.Conn, hdr []byte) {
-	orig := conn.RemoteAddr()
-	origHost, origPort := netAddrIpPort(orig)
+// chanConn adapts an ssh.Channel to net.Conn for http.Transport. Deadlines
+// are accepted and ignored: the Transport paces itself with timers, and the
+// channel dies with its SSH connection.
+type chanConn struct {
+	ssh.Channel
+}
 
+var chanConnAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+
+func (c chanConn) LocalAddr() net.Addr                { return chanConnAddr }
+func (c chanConn) RemoteAddr() net.Addr               { return chanConnAddr }
+func (c chanConn) SetDeadline(t time.Time) error      { return nil }
+func (c chanConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c chanConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func (uc *usshConn) Dial(originHost string, originPort uint32) (net.Conn, error) {
 	payload := struct {
 		DestAddr   string
 		DestPort   uint32
@@ -646,47 +658,16 @@ func (uc *usshConn) Pass(conn net.Conn, hdr []byte) {
 	}{
 		DestAddr:   uc.fwhost,
 		DestPort:   80,
-		OriginAddr: origHost,
-		OriginPort: origPort,
+		OriginAddr: originHost,
+		OriginPort: originPort,
 	}
 	sshch, reqs, err := uc.sc.OpenChannel("forwarded-tcpip",
 		ssh.Marshal(payload))
 	if err != nil {
-		uc.sshd.httpd.Say502(conn)
-		return
+		return nil, err
 	}
-
 	go ssh.DiscardRequests(reqs)
-	_, err = sshch.Write(hdr)
-
-	if err != nil {
-		uc.sshd.httpd.Say502(conn)
-		sshch.Close()
-		return
-	}
-
-	func() {
-		defer conn.Close()
-		defer sshch.Close()
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		go func() {
-			defer wg.Done()
-			io.Copy(conn, sshch)
-			if tcp, ok := conn.(*net.TCPConn); ok {
-				tcp.CloseWrite()
-			} else {
-				conn.Close()
-			}
-		}()
-		go func() {
-			defer wg.Done()
-			io.Copy(sshch, conn)
-			sshch.CloseWrite()
-		}()
-		wg.Wait()
-	}()
+	return chanConn{Channel: sshch}, nil
 }
 
 func (uc *usshConn) Overtake() {
@@ -755,10 +736,7 @@ func main() {
 	svrCfg.AddHostKey(mustLoadPrivateKey("id_rsa"))
 	svrCfg.AddHostKey(mustLoadPrivateKey("id_ed25519"))
 
-	httpd := &Ushttpd{
-		conf:       conf,
-		forwarders: make(map[string]Forwarder),
-	}
+	httpd := newUshttpd(conf)
 
 	sshd := &Usshd{
 		conf:    conf,
