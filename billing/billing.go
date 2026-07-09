@@ -378,6 +378,23 @@ func (b *Billing) dbReinvoiceUser(ctx context.Context, u string) error {
 }
 
 func (b *Billing) dbAdmitUser(ctx context.Context, u string) error {
+	// A single payment may yield several paid signals: the websocket stream
+	// races the 15s poller, and lnbits 1.x notifies an internal payment's
+	// receiver twice on its own (directly from _pay_internal_invoice and again
+	// via the internal-invoice queue). Admission is therefore idempotent — an
+	// already admitted user keeps the shortname the first admission assigned,
+	// instead of a duplicate signal generating (and persisting) a fresh one
+	// behind the session's back.
+	row := b.db.QueryRow("SELECT shortname FROM users WHERE id=?", u)
+	var existing *string
+	if err := row.Scan(&existing); err != nil {
+		return err
+	}
+	if existing != nil {
+		b.uc.Put(&UserRecord{Id: u, ShortName: *existing})
+		return nil
+	}
+
 	// mark as admitted
 	n := b.conf.ShortNameLen
 	if n < 1 {
@@ -389,12 +406,13 @@ func (b *Billing) dbAdmitUser(ctx context.Context, u string) error {
 		row := b.db.QueryRow("SELECT id FROM users WHERE shortname=?", shortName)
 		var r string
 		err := row.Scan(&r)
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
+		if errors.Is(err, sql.ErrNoRows) {
+			break // name is free
 		}
 		if err != nil {
-			break
+			return err
 		}
+		// name taken: roll again
 	}
 	_, err := b.db.Exec("UPDATE users SET payhash = NULL, shortname = ? WHERE id = ?", shortName, u)
 	if err != nil {
