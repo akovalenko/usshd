@@ -3,6 +3,9 @@ package billing
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
@@ -92,6 +95,81 @@ func TestAdmitCollisionRetries(t *testing.T) {
 	}
 	if got := b.uc.Get("fp").ShortName; got != free {
 		t.Fatalf("admitted shortname %q, want the only free name %q", got, free)
+	}
+}
+
+// TestReinvoiceStaleVerdict pins the TOCTOU guard in dbReinvoiceUser: a queued
+// dead-invoice verdict must be dropped when the row no longer holds the payhash
+// the verdict was about (the user was reinvoiced or admitted meanwhile).
+// Without the guard a stale poller event replaced a fresh live invoice, and a
+// no-PTY session that had already exited with that invoice left its payer
+// holding a payable bolt11 nobody watched.
+func TestReinvoiceStaleVerdict(t *testing.T) {
+	db := newTestDB(t)
+	// nil lnbits client: a dropped verdict must never reach addInvoice
+	b := NewBilling(&BillingConf{}, db, nil)
+	if _, err := db.Exec("INSERT INTO users (id, payhash) VALUES(?,?)",
+		"fp", "live"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.dbReinvoiceUser(context.Background(), "fp", "dead"); err != nil {
+		t.Fatal(err)
+	}
+	var ph string
+	if err := db.QueryRow("SELECT payhash FROM users WHERE id=?",
+		"fp").Scan(&ph); err != nil {
+		t.Fatal(err)
+	}
+	if ph != "live" {
+		t.Fatalf("stale verdict replaced payhash: %q", ph)
+	}
+
+	// user admitted meanwhile (payhash cleared): same drop
+	if _, err := db.Exec("UPDATE users SET payhash=NULL, shortname='ab' WHERE id=?",
+		"fp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.dbReinvoiceUser(context.Background(), "fp", "dead"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReinvoiceMatchingVerdict pins the complement: a verdict about the payhash
+// the row still holds does reinvoice — payhash replaced in the DB, fresh bolt11
+// published to the cache.
+func TestReinvoiceMatchingVerdict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("content-type", "application/json")
+			w.WriteHeader(201)
+			fmt.Fprint(w,
+				`{"payment_hash":"fresh","payment_request":"lnbc-fresh"}`)
+		}))
+	defer srv.Close()
+
+	db := newTestDB(t)
+	b := NewBilling(&BillingConf{Cost: 1000}, db, &lnbits.Client{Url: srv.URL})
+	if _, err := db.Exec("INSERT INTO users (id, payhash) VALUES(?,?)",
+		"fp", "dead"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.dbReinvoiceUser(context.Background(), "fp", "dead"); err != nil {
+		t.Fatal(err)
+	}
+	var ph string
+	if err := db.QueryRow("SELECT payhash FROM users WHERE id=?",
+		"fp").Scan(&ph); err != nil {
+		t.Fatal(err)
+	}
+	if ph != "fresh" {
+		t.Fatalf("payhash after matching verdict: %q, want %q", ph, "fresh")
+	}
+	rec := b.uc.Get("fp")
+	if rec.Bolt11 != "lnbc-fresh" || rec.Payhash != "fresh" {
+		t.Fatalf("cache after reinvoice: bolt11=%q payhash=%q",
+			rec.Bolt11, rec.Payhash)
 	}
 }
 

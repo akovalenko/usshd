@@ -155,6 +155,15 @@ type BillingConf struct {
 	ShortNameLen int
 }
 
+// expiredEvent names the exact invoice a dead-verdict was issued about. The
+// payhash travels with the event so dbReinvoiceUser can drop verdicts that
+// went stale in the queue (the poller races serveDb) instead of replacing
+// whatever invoice the user's row holds by then.
+type expiredEvent struct {
+	id      string
+	payhash string
+}
+
 type Billing struct {
 	conf       *BillingConf
 	db         *sql.DB
@@ -162,7 +171,7 @@ type Billing struct {
 	uc         *userCache
 	interested chan string
 	paid       chan string
-	expired    chan string
+	expired    chan expiredEvent
 }
 
 func NewBilling(conf *BillingConf, db *sql.DB, lnbc *lnbits.Client) *Billing {
@@ -173,7 +182,7 @@ func NewBilling(conf *BillingConf, db *sql.DB, lnbc *lnbits.Client) *Billing {
 		uc:         newUserCache(),
 		interested: make(chan string, 16),
 		paid:       make(chan string, 16),
-		expired:    make(chan string, 16),
+		expired:    make(chan expiredEvent, 16),
 	}
 }
 
@@ -261,9 +270,9 @@ func (b *Billing) serveDb(ctx context.Context) error {
 			if err := b.dbAdmitUser(ctx, u); err != nil {
 				log.Printf("billing: admit %s: %v", u, err)
 			}
-		case u := <-b.expired:
-			if err := b.dbReinvoiceUser(ctx, u); err != nil {
-				log.Printf("billing: reinvoice %s: %v", u, err)
+		case e := <-b.expired:
+			if err := b.dbReinvoiceUser(ctx, e.id, e.payhash); err != nil {
+				log.Printf("billing: reinvoice %s: %v", e.id, err)
 			}
 		case <-ctx.Done():
 			return nil
@@ -305,7 +314,7 @@ func (b *Billing) dbInterested(ctx context.Context, u string) error {
 	if err != nil {
 		if errors.Is(err, lnbits.ErrNotFound) {
 			// legacy path: older lnbits deleted expired invoices (404)
-			return b.dbReinvoiceUser(ctx, u)
+			return b.dbReinvoiceUser(ctx, u, *payhash)
 		}
 		return err
 	}
@@ -316,7 +325,7 @@ func (b *Billing) dbInterested(ctx context.Context, u string) error {
 	if invoiceDead(invData) {
 		// lnbits 1.x keeps expired invoices (flipped to failed) rather than
 		// deleting them, so this replaces the vanished-invoice 404 above.
-		return b.dbReinvoiceUser(ctx, u)
+		return b.dbReinvoiceUser(ctx, u, *payhash)
 	}
 	b.uc.Put(&UserRecord{
 		Id:      u,
@@ -354,8 +363,26 @@ func (b *Billing) dbFreshUser(ctx context.Context, u string) error {
 	return nil
 }
 
-func (b *Billing) dbReinvoiceUser(ctx context.Context, u string) error {
-	// reinvoiced user
+func (b *Billing) dbReinvoiceUser(ctx context.Context, u string, dead string) error {
+	// A dead-invoice verdict can be stale by the time it is processed: the
+	// poller computes it from a cache snapshot plus a network fetch, and the
+	// queued event may land after this goroutine has already reinvoiced (or
+	// admitted) the same user. Reinvoice only while the row still holds the
+	// payhash the verdict was about — replacing a fresh live invoice would
+	// strand its payer: a no-PTY session prints the first invoice and exits,
+	// and a payment against a superseded payhash is never noticed (gotPaid
+	// drops unknown hashes, the poller only watches the current one). This
+	// check-then-update is race-free because serveDb is the sole DB writer.
+	row := b.db.QueryRow("SELECT payhash FROM users WHERE id=?", u)
+	var current *string
+	if err := row.Scan(&current); err != nil {
+		return err
+	}
+	if current == nil || *current != dead {
+		// admitted or reinvoiced meanwhile; the verdict is about a payhash
+		// this row no longer holds
+		return nil
+	}
 	ph, pr, err := b.addInvoice(ctx)
 	if err != nil {
 		// may be temporary
@@ -461,7 +488,7 @@ func (b *Billing) check(ctx context.Context) error {
 		invData, err := b.lnbc.GetInvoice(ctx, rec.Payhash)
 		if err != nil {
 			if errors.Is(err, lnbits.ErrNotFound) {
-				b.expired <- rec.Id
+				b.expired <- expiredEvent{rec.Id, rec.Payhash}
 				continue
 			}
 			return err
@@ -471,7 +498,7 @@ func (b *Billing) check(ctx context.Context) error {
 			continue
 		}
 		if invoiceDead(invData) {
-			b.expired <- rec.Id
+			b.expired <- expiredEvent{rec.Id, rec.Payhash}
 		}
 	}
 	return nil
