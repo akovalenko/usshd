@@ -23,11 +23,9 @@ type InvoiceData struct {
 		Pending     bool         `json:"pending"`
 		Amount      int64        `json:"amount"`
 		Memo        string       `json:"memo"`
-		Time        int64        `json:"time"`
 		Bolt11      string       `json:"bolt11"`
 		Preimage    string       `json:"preimage"`
 		PaymentHash string       `json:"payment_hash"`
-		Expiry      float64      `json:"expiry"`
 		Extra       InvoiceExtra `json:"extra"`
 		WalletId    string       `json:"wallet_id"`
 	} `json:"details"`
@@ -35,13 +33,11 @@ type InvoiceData struct {
 
 type InvoiceEventData struct {
 	Pending     bool         `json:"pending"`
-	Time        int64        `json:"time"`
 	Amount      int64        `json:"amount"`
 	Memo        string       `json:"memo"`
 	PaymentHash string       `json:"payment_hash"`
 	Bolt11      string       `json:"bolt11"`
 	Preimage    string       `json:"preimage"`
-	Expiry      float64      `json:"expiry"`
 	Extra       InvoiceExtra `json:"extra"`
 }
 

@@ -17,7 +17,6 @@ type UserRecord struct {
 	Bolt11    string
 	Payhash   string
 	ShortName string
-	Expiry    int64
 }
 
 type userCacheEntry struct {
@@ -320,7 +319,6 @@ func (b *Billing) dbInterested(ctx context.Context, u string) error {
 		Id:      u,
 		Bolt11:  invData.Details.Bolt11,
 		Payhash: *payhash,
-		Expiry:  int64(invData.Details.Expiry),
 	})
 
 	return nil
@@ -344,18 +342,11 @@ func (b *Billing) dbFreshUser(ctx context.Context, u string) error {
 		// should always work
 		return err
 	}
-	// get expiry etc
-	invData, err := b.lnbc.GetInvoice(ctx, ph)
-	if err != nil {
-		return err
-	}
-
 	// now we publish the invoice locally
 	b.uc.Put(&UserRecord{
 		Id:      u,
 		Payhash: ph,
 		Bolt11:  pr,
-		Expiry:  int64(invData.Details.Expiry),
 	})
 	return nil
 }
@@ -374,18 +365,11 @@ func (b *Billing) dbReinvoiceUser(ctx context.Context, u string) error {
 		return err
 	}
 
-	// get expiry etc
-	invData, err := b.lnbc.GetInvoice(ctx, ph)
-	if err != nil {
-		return err
-	}
-
 	// now we publish the invoice locally
 	b.uc.Put(&UserRecord{
 		Id:      u,
 		Payhash: ph,
 		Bolt11:  pr,
-		Expiry:  int64(invData.Details.Expiry),
 	})
 	return nil
 }
