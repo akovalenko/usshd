@@ -248,7 +248,43 @@ func (uh *Ushttpd) handleConn(conn net.Conn) {
 		uh.Say502(conn)
 		return
 	}
-	fwd.Pass(conn, hbuff.Bytes())
+	fwd.Pass(conn, forceConnClose(hbuff.Bytes(), req))
+}
+
+// forceConnClose patches the buffered request head to carry
+// "Connection: close". Routing here is per-connection: the first request's
+// x-forwarded-host picks the tunnel and the rest of the connection is
+// spliced into it raw. If the tunneled backend answered keep-alive, a
+// pooling front proxy (Caddy) would return the spliced connection to its
+// per-upstream idle pool and reuse it for later requests to ARBITRARY
+// subdomains, tunneling them past routing entirely. Closing after one
+// response makes the proxy open a fresh — freshly routed — connection per
+// request. Upgrade handshakes (websockets) pass through untouched: an
+// upgraded connection is dedicated to one client and never pooled.
+func forceConnClose(raw []byte, req *http.Request) []byte {
+	if req.Header.Get("Upgrade") != "" ||
+		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade") {
+		return raw
+	}
+	head, rest, found := bytes.Cut(raw, []byte("\r\n\r\n"))
+	if !found {
+		return raw
+	}
+	lines := bytes.Split(head, []byte("\r\n"))
+	out := make([][]byte, 0, len(lines)+1)
+	for i, line := range lines {
+		if i > 0 {
+			l := bytes.ToLower(line)
+			if bytes.HasPrefix(l, []byte("connection:")) ||
+				bytes.HasPrefix(l, []byte("proxy-connection:")) {
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	out = append(out, []byte("Connection: close"))
+	patched := bytes.Join(out, []byte("\r\n"))
+	return append(append(patched, "\r\n\r\n"...), rest...)
 }
 
 type Usshd struct {
