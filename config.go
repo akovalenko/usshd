@@ -32,7 +32,11 @@ type Config struct {
 	LnbitsHost   string // LNBITS_HOST
 	LnbitsApiKey string // LNBITS_API_KEY
 
-	// Listeners.
+	// Listeners. LISTEN_SSH is where the process binds, not what users are
+	// told: the public SSH endpoint is <SSHHost>:22 by design — every printed
+	// instruction, the SKILL.md contract and the /known_hosts fragment assume
+	// ssh with no -p. Production binds 0.0.0.0:22 (or otherwise routes port 22
+	// here); the unprivileged 8024 default exists for development.
 	ListenSSH  string // LISTEN_SSH
 	ListenHTTP string // LISTEN_HTTP
 
