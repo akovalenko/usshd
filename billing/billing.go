@@ -5,11 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/akovalenko/usshd/lnbits"
 	"log"
 	"math/rand/v2"
 	"sync"
 	"time"
-	"github.com/akovalenko/usshd/lnbits"
 )
 
 type UserRecord struct {

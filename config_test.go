@@ -102,7 +102,7 @@ func TestDescriptionsRender(t *testing.T) {
 		}},
 		{"skill.md.tmpl", []string{
 			"name: usshd-onboarding",
-			"ssh app@ssh.example.com </dev/null",          // port-less status check (Steps 1/3)
+			"ssh app@ssh.example.com </dev/null",            // port-less status check (Steps 1/3)
 			"ssh -R80:localhost:<PORT> app@ssh.example.com", // the actual forward (Step 4)
 			"Please pay:",
 			"Your forwarded site:",
