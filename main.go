@@ -130,6 +130,7 @@ type Forwarder interface {
 // tunnel keep-alive cannot cross subdomains structurally.
 type Ushttpd struct {
 	conf       *Config
+	hostKeys   []ssh.PublicKey // published for pinning: landing + /known_hosts
 	mu         sync.Mutex
 	forwarders map[string]Forwarder
 	transport  *http.Transport
@@ -264,8 +265,50 @@ func (uh *Ushttpd) RemoveForwarder(host string, io Forwarder) {
 	uh.mu.Unlock()
 }
 
-// serveLanding answers the landing host itself (the description page and
-// SKILL.md), rendering the whole-file templates against the installation config.
+// hostKeyView is one host key as the landing publishes it for pinning.
+type hostKeyView struct {
+	Type        string // key algorithm, e.g. "ssh-ed25519"
+	Fingerprint string // OpenSSH-style "SHA256:…" — what the TOFU prompt shows
+	Line        string // ready known_hosts line: "<sshhost> <type> <base64>"
+}
+
+// landingData is what the landing templates render against: the installation
+// config (fields promote as before) plus the live host keys. Deriving the
+// published material from the keys the daemon actually serves with keeps it
+// congruent with reality — including after a key rotation — with nothing to
+// configure.
+type landingData struct {
+	*Config
+	HostKeys []hostKeyView
+}
+
+func (uh *Ushttpd) landingData() *landingData {
+	d := &landingData{Config: uh.conf}
+	for _, pub := range uh.hostKeys {
+		d.HostKeys = append(d.HostKeys, hostKeyView{
+			Type:        pub.Type(),
+			Fingerprint: ssh.FingerprintSHA256(pub),
+			Line: uh.conf.SSHHost + " " +
+				strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub))),
+		})
+	}
+	return d
+}
+
+// knownHostsText renders the ready-to-append known_hosts fragment served on
+// /known_hosts: one line per host key, named for the installation's SSH host.
+func (uh *Ushttpd) knownHostsText() string {
+	var b strings.Builder
+	for _, k := range uh.landingData().HostKeys {
+		b.WriteString(k.Line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// serveLanding answers the landing host itself (the description page, SKILL.md
+// and the known_hosts fragment), rendering the whole-file templates against
+// the installation config and host keys.
 func (uh *Ushttpd) serveLanding(w http.ResponseWriter, r *http.Request) {
 	var tmpl, ctype string
 	switch r.URL.Path {
@@ -273,12 +316,18 @@ func (uh *Ushttpd) serveLanding(w http.ResponseWriter, r *http.Request) {
 		tmpl, ctype = "landing.html.tmpl", "text/html; charset=utf-8"
 	case "/SKILL.md":
 		tmpl, ctype = "skill.md.tmpl", "text/markdown; charset=utf-8"
+	case "/known_hosts":
+		// The page is served over HTTPS, so this fragment lets clients pin
+		// the SSH host keys through WebPKI instead of trusting first use.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(uh.knownHostsText()))
+		return
 	default:
 		http.NotFound(w, r)
 		return
 	}
 	var body bytes.Buffer
-	if err := descriptions.ExecuteTemplate(&body, tmpl, uh.conf); err != nil {
+	if err := descriptions.ExecuteTemplate(&body, tmpl, uh.landingData()); err != nil {
 		log.Printf("render %s: %v", tmpl, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -674,18 +723,6 @@ func (uc *usshConn) Overtake() {
 	uc.sc.Close()
 }
 
-func mustLoadPrivateKey(filename string) ssh.Signer {
-	idh, err := os.ReadFile(filename)
-	if err != nil {
-		log.Fatal("readfile: ", err)
-	}
-	signer, err := ssh.ParsePrivateKey(idh)
-	if err != nil {
-		log.Fatal("parse: ", err)
-	}
-	return signer
-}
-
 func main() {
 
 	conf := loadConfig()
@@ -732,11 +769,15 @@ func main() {
 		PublicKeyCallback: makeAuthCallback(conf.SSHUser),
 	}
 
-	svrCfg.AddHostKey(mustLoadPrivateKey("id_ecdsa"))
-	svrCfg.AddHostKey(mustLoadPrivateKey("id_rsa"))
-	svrCfg.AddHostKey(mustLoadPrivateKey("id_ed25519"))
-
+	hostSigners, err := loadHostKeys()
+	if err != nil {
+		log.Fatal(err)
+	}
 	httpd := newUshttpd(conf)
+	for _, signer := range hostSigners {
+		svrCfg.AddHostKey(signer)
+		httpd.hostKeys = append(httpd.hostKeys, signer.PublicKey())
+	}
 
 	sshd := &Usshd{
 		conf:    conf,

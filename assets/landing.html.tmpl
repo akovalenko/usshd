@@ -72,6 +72,22 @@ a script or by an LLM agent. The invoice is printed on a stable line —
 guide with the exact steps (get the invoice, pay it or hand it to the user, then
 bring up the tunnel): <a href="/SKILL.md">/SKILL.md</a>.</p>
 
+<h2>SSH host keys</h2>
+
+<p>On the very first connect ssh cannot know this server's identity and asks you
+to trust an unverified fingerprint. You can do better: this page is served over
+HTTPS, so pin the host keys through it before connecting — the prompt then never
+appears, and later connects are verified:</p>
+
+<pre><code>curl -s https://{{.LandingHost}}/known_hosts &gt;&gt; ~/.ssh/known_hosts</code></pre>
+
+<p>The <a href="/known_hosts">/known_hosts</a> fragment is generated from the
+live host keys. If you prefer to answer the first-use prompt manually, compare
+the fingerprint it shows against this list:</p>
+
+<pre><code>{{range .HostKeys}}{{.Fingerprint}} ({{.Type}})
+{{end}}</code></pre>
+
 <footer>
 Powered by <a href="{{.SourceURL}}">usshd</a>.
 </footer>

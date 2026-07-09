@@ -24,6 +24,21 @@ without serving anything** — see Step 1.
   needed **only if you actually want to serve an app** (Step 4). To check status,
   look up your subdomain, or pay, no port is needed.
 
+## Step 0 — pin the host keys (once per environment)
+
+The server's SSH host keys are published over HTTPS as a ready known_hosts
+fragment at `https://{{.LandingHost}}/known_hosts`. Pin them before the first
+connect, so every ssh command below verifies the host instead of trusting it on
+first use:
+
+```
+mkdir -p ~/.ssh && curl -s https://{{.LandingHost}}/known_hosts >> ~/.ssh/known_hosts
+```
+
+If you cannot (or prefer not to) touch `~/.ssh`, save the fragment to any file
+and add `-o UserKnownHostsFile=<file>` to the ssh commands below. Skip this step
+if the keys are already pinned in your environment.
+
 ## Step 1 — check status: your subdomain, or an invoice
 
 Connect once with stdin closed and read what the server prints. This sets up **no

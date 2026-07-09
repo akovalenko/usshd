@@ -2,10 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 )
 
 func testConf() *Config {
@@ -19,6 +24,20 @@ func testConf() *Config {
 		LandingHost:   "app.example.com",
 		SourceURL:     "https://github.com/akovalenko/usshd",
 	}
+}
+
+// testHostKey returns a fresh ed25519 public key for landing/known_hosts tests.
+func testHostKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return spub
 }
 
 func render(t *testing.T, name string, v view) string {
@@ -83,9 +102,15 @@ func TestMarkerContracts(t *testing.T) {
 	}
 }
 
-// TestDescriptionsRender renders the landing page and SKILL.md against a Config,
-// checking the installation values substitute and the stable markers survive.
+// TestDescriptionsRender renders the landing page and SKILL.md against the
+// landing data (config + host keys), checking the installation values
+// substitute, the stable markers survive and the pinning material shows up.
 func TestDescriptionsRender(t *testing.T) {
+	uh := newUshttpd(testConf())
+	uh.hostKeys = []ssh.PublicKey{testHostKey(t)}
+	data := uh.landingData()
+	fprint := data.HostKeys[0].Fingerprint
+
 	cases := []struct {
 		tmpl string
 		want []string
@@ -97,6 +122,9 @@ func TestDescriptionsRender(t *testing.T) {
 			"&lt;name&gt;.app.example.com",
 			`href="/SKILL.md"`,
 			"https://github.com/akovalenko/usshd",
+			"curl -s https://app.example.com/known_hosts",
+			`href="/known_hosts"`,
+			fprint + " (ssh-ed25519)",
 		}},
 		{"skill.md.tmpl", []string{
 			"name: usshd-onboarding",
@@ -105,11 +133,12 @@ func TestDescriptionsRender(t *testing.T) {
 			"Please pay:",
 			"Your forwarded site:",
 			"1000 sat",
+			"https://app.example.com/known_hosts", // Step 0: pin before first connect
 		}},
 	}
 	for _, c := range cases {
 		var b bytes.Buffer
-		if err := descriptions.ExecuteTemplate(&b, c.tmpl, testConf()); err != nil {
+		if err := descriptions.ExecuteTemplate(&b, c.tmpl, data); err != nil {
 			t.Fatalf("render %q: %v", c.tmpl, err)
 		}
 		got := b.String()
@@ -121,17 +150,50 @@ func TestDescriptionsRender(t *testing.T) {
 	}
 }
 
+// TestKnownHostsFragment parses the /known_hosts payload back with the ssh
+// library: every line must be a valid known_hosts entry naming the
+// installation's SSH host, one per host key.
+func TestKnownHostsFragment(t *testing.T) {
+	uh := newUshttpd(testConf())
+	uh.hostKeys = []ssh.PublicKey{testHostKey(t), testHostKey(t)}
+
+	rest := []byte(uh.knownHostsText())
+	seen := 0
+	for len(rest) > 0 {
+		_, hosts, pub, _, r, err := ssh.ParseKnownHosts(rest)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatal(err)
+		}
+		if len(hosts) != 1 || hosts[0] != "ssh.example.com" {
+			t.Errorf("entry %d: hosts %v, want [ssh.example.com]", seen, hosts)
+		}
+		if pub.Type() != "ssh-ed25519" {
+			t.Errorf("entry %d: type %s, want ssh-ed25519", seen, pub.Type())
+		}
+		rest = r
+		seen++
+	}
+	if seen != 2 {
+		t.Errorf("parsed %d known_hosts entries, want 2", seen)
+	}
+}
+
 // TestServeLanding drives the landing pages through ServeHTTP (routed by
 // x-forwarded-host), verifying status, content-type and body for both served
 // paths and the 404 fallback.
 func TestServeLanding(t *testing.T) {
 	uh := newUshttpd(testConf())
+	uh.hostKeys = []ssh.PublicKey{testHostKey(t)}
 	for _, tc := range []struct {
 		path, ctype, want string
 		code              int
 	}{
 		{"/", "text/html", "Share your local web app", 200},
 		{"/SKILL.md", "text/markdown", "usshd-onboarding", 200},
+		{"/known_hosts", "text/plain", "ssh.example.com ssh-ed25519 ", 200},
 		{"/nope", "", "", 404},
 	} {
 		req := httptest.NewRequest("GET", "http://front"+tc.path, nil)
